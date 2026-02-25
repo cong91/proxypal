@@ -6,18 +6,25 @@
 //!
 //! ## Usage
 //!
-//! ```
-//! // Parse rotation:// URL
-//! let provider = RotationProxyProvider::new("rotation://proxyxoay.shop?key=XXX&nhamang=random&tinhthanh=0")?;
+//! ```ignore
+//! use proxypal_lib::RotationProxyProvider;
 //!
-//! // Get or refresh cached proxy
-//! let cached = provider.get_or_refresh().await?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), String> {
+//!     // Parse rotation:// URL
+//!     let provider = RotationProxyProvider::new("rotation://proxyxoay.shop?key=XXX&nhamang=random&tinhthanh=0")?;
 //!
-//! // Resolve to standard proxy URL
-//! let proxy_url = RotationProxyProvider::resolve_proxy_url(&cached);
+//!     // Get or refresh cached proxy
+//!     let cached = provider.get_or_refresh().await?;
+//!
+//!     // Resolve to standard proxy URL
+//!     let proxy_url = RotationProxyProvider::resolve_proxy_url(&cached);
+//!     Ok(())
+//! }
 //! ```
 
 use crate::types::proxy::{CachedProxy, RotationConfig, RotationProxyResponse};
+use log::{debug, error, info, warn};
 use regex::Regex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,7 +50,12 @@ impl RotationProxyProvider {
     /// # Example
     /// `rotation://proxyxoay.shop?key=abc123&nhamang=random&tinhthanh=0`
     pub fn new(rotation_url: &str) -> Result<Self, String> {
+        info!("[RotationProxy] Creating provider from URL: {}", rotation_url);
+        
         let config = parse_rotation_url(rotation_url)?;
+        
+        info!("[RotationProxy] Parsed config - API URL: {}, nhamang: {}, tinhthanh: {}",
+              config.api_url, config.nhamang, config.tinhthanh);
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -59,30 +71,46 @@ impl RotationProxyProvider {
 
     /// Fetch a new proxy from the provider API with retry logic
     ///
-    /// Implements retry with exponential backoff.
-    /// If provider returns waiting/cooldown status, retries follow provider TTL.
+    /// Implements retry with exponential backoff (max 3 attempts).
+    /// If provider returns waiting/cooldown status (status 101), returns error immediately
+    /// with cooldown info for UI to display - does NOT block waiting.
     pub async fn fetch_proxy(&self) -> Result<CachedProxy, String> {
-        let max_retries = 5;
+        info!("[RotationProxy] Starting proxy fetch with retry logic");
+        let max_retries = 3;
         let mut last_error = String::new();
 
         for attempt in 0..max_retries {
+            debug!("[RotationProxy] Fetch attempt {}/{}", attempt + 1, max_retries);
             match self.fetch_proxy_once().await {
-                Ok(proxy) => return Ok(proxy),
+                Ok(proxy) => {
+                    info!("[RotationProxy] Fetch succeeded on attempt {}", attempt + 1);
+                    return Ok(proxy);
+                }
                 Err(e) => {
-                    last_error = e;
+                    last_error = e.clone();
+                    warn!(
+                        "[RotationProxy] Fetch attempt {} failed: {}",
+                        attempt + 1, last_error
+                    );
+                    
+                    // Check if this is a cooldown error - return immediately, don't sleep
+                    if let Some(wait_seconds) = parse_waiting_error_delay(&last_error) {
+                        warn!(
+                            "[RotationProxy] Provider cooldown detected: {}s remaining. Returning immediately without blocking.",
+                            wait_seconds
+                        );
+                        return Err(format!(
+                            "Proxy rotation on cooldown. Please wait {} seconds before rotating again.",
+                            wait_seconds
+                        ));
+                    }
+                    
                     if attempt < max_retries - 1 {
-                        let delay = if let Some(wait_seconds) = parse_waiting_error_delay(&last_error)
-                        {
-                            Duration::from_secs(wait_seconds.saturating_add(1).min(120))
-                        } else {
-                            Duration::from_secs(2u64.pow(attempt as u32 + 1))
-                        };
-
-                        println!(
-                            "[RotationProxy] Fetch attempt {} failed, retrying in {}s: {}",
-                            attempt + 1,
-                            delay.as_secs(),
-                            last_error
+                        // Use short exponential backoff for non-cooldown errors
+                        let delay = Duration::from_secs(2u64.pow(attempt as u32).min(8));
+                        info!(
+                            "[RotationProxy] Retrying in {}s (attempt {}/{})",
+                            delay.as_secs(), attempt + 1, max_retries
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -90,6 +118,10 @@ impl RotationProxyProvider {
             }
         }
 
+        error!(
+            "[RotationProxy] Failed to fetch proxy after {} attempts: {}",
+            max_retries, last_error
+        );
         Err(format!(
             "Failed to fetch proxy after {} attempts: {}",
             max_retries, last_error
@@ -98,31 +130,49 @@ impl RotationProxyProvider {
 
     /// Single fetch attempt (internal)
     async fn fetch_proxy_once(&self) -> Result<CachedProxy, String> {
+        info!("[RotationProxy] Sending API request to: {}", self.config.api_url);
+        
         let response = self
             .client
             .get(&self.config.api_url)
             .send()
             .await
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| {
+                error!("[RotationProxy] HTTP request failed: {}", e);
+                format!("HTTP request failed: {}", e)
+            })?;
 
-        if !response.status().is_success() {
-            return Err(format!("API returned error status: {}", response.status()));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!("[RotationProxy] API returned error status: {}, body: {}", status, body);
+            return Err(format!("API returned error status: {}", status));
         }
 
         let response_text = response
             .text()
             .await
-            .map_err(|e| format!("Failed to read API response body: {}", e))?;
+            .map_err(|e| {
+                error!("[RotationProxy] Failed to read API response body: {}", e);
+                format!("Failed to read API response body: {}", e)
+            })?;
 
-        println!("[RotationProxy][DEBUG] Raw API response: {}", response_text);
+        debug!("[RotationProxy] Raw API response: {}", response_text);
 
         let proxy_response: RotationProxyResponse = serde_json::from_str(&response_text)
-            .map_err(|e| format!("Failed to parse API response: {} | body: {}", e, response_text))?;
+            .map_err(|e| {
+                error!("[RotationProxy] Failed to parse API response: {} | body: {}", e, response_text);
+                format!("Failed to parse API response: {} | body: {}", e, response_text)
+            })?;
+
+        debug!("[RotationProxy] Parsed response - status: {:?}, message: {}, http_proxy: {}, socks5_proxy: {}",
+               proxy_response.status, proxy_response.message,
+               proxy_response.proxy_http, proxy_response.proxy_socks5);
 
         if !is_success_status(&proxy_response.status) {
             if is_waiting_status(&proxy_response.status) {
                 let wait_seconds = parse_ttl_from_message(&proxy_response.message);
-                println!(
+                warn!(
                     "[RotationProxy] Provider asks to wait {}s before rotating: {}",
                     wait_seconds, proxy_response.message
                 );
@@ -132,6 +182,11 @@ impl RotationProxyProvider {
                 ));
             }
 
+            error!(
+                "[RotationProxy] API returned non-success status: {} | message: {}",
+                status_to_string(&proxy_response.status),
+                proxy_response.message
+            );
             return Err(format!(
                 "API returned non-success status: {} | message: {}",
                 status_to_string(&proxy_response.status),
@@ -153,14 +208,15 @@ impl RotationProxyProvider {
         let cached = CachedProxy {
             http_proxy: proxy_response.proxy_http.clone(),
             socks5_proxy: proxy_response.proxy_socks5.clone(),
+            real_ip: proxy_response.ip.clone(),
             expires_at: now + Duration::from_secs(effective_ttl),
             ttl_seconds: effective_ttl,
             created_at: now,
         };
 
-        println!(
-            "[RotationProxy] Fetched new proxy, TTL: {}s (effective: {}s)",
-            ttl_seconds, effective_ttl
+        info!(
+            "[RotationProxy] Fetched new proxy - HTTP: {}, SOCKS5: {}, Real IP: {}, TTL: {}s (effective: {}s)",
+            cached.http_proxy, cached.socks5_proxy, cached.real_ip, ttl_seconds, effective_ttl
         );
 
         Ok(cached)
@@ -174,9 +230,14 @@ impl RotationProxyProvider {
         {
             let cache = self.cache.read().await;
             if let Some(ref cached) = *cache {
+                let expires_in = cached.expires_in_seconds();
                 if !cached.is_expired() {
+                    debug!("[RotationProxy] Cache hit, expires in {}s", expires_in);
                     return Ok(cached.clone());
                 }
+                info!("[RotationProxy] Cache expired (expired {}s ago), refreshing...", expires_in);
+            } else {
+                info!("[RotationProxy] Cache miss, fetching new proxy");
             }
         }
 
@@ -186,6 +247,7 @@ impl RotationProxyProvider {
         // Double-check after acquiring write lock
         if let Some(ref cached) = *cache {
             if !cached.is_expired() {
+                debug!("[RotationProxy] Cache updated by another thread, using cached");
                 return Ok(cached.clone());
             }
         }
@@ -194,7 +256,7 @@ impl RotationProxyProvider {
         let new_proxy = self.fetch_proxy().await?;
         *cache = Some(new_proxy.clone());
 
-        println!(
+        info!(
             "[RotationProxy] Cache updated with new proxy, expires in {}s",
             new_proxy.ttl_seconds
         );
@@ -207,22 +269,40 @@ impl RotationProxyProvider {
     /// Used when the current proxy is detected as dead or when user
     /// manually requests rotation.
     pub async fn force_rotate(&self) -> Result<CachedProxy, String> {
-        println!("[RotationProxy] Force rotating proxy...");
+        info!("[RotationProxy] Force rotating proxy - clearing cache and fetching new");
 
         // Clear cache
         {
             let mut cache = self.cache.write().await;
+            let had_cache = cache.is_some();
             *cache = None;
+            info!("[RotationProxy] Cache cleared (had previous entry: {})", had_cache);
         }
 
         // Fetch new proxy
-        self.get_or_refresh().await
+        let result = self.get_or_refresh().await;
+        match &result {
+            Ok(cached) => {
+                info!("[RotationProxy] Force rotate successful, new proxy expires in {}s",
+                      cached.ttl_seconds);
+            }
+            Err(e) => {
+                error!("[RotationProxy] Force rotate failed: {}", e);
+            }
+        }
+        result
     }
 
     /// Get current cached proxy without fetching
     pub async fn get_cached(&self) -> Option<CachedProxy> {
         let cache = self.cache.read().await;
-        cache.clone()
+        let result = cache.clone();
+        if let Some(ref cached) = result {
+            debug!("[RotationProxy] Got cached proxy, expires in {}s", cached.expires_in_seconds());
+        } else {
+            debug!("[RotationProxy] No cached proxy available");
+        }
+        result
     }
 
     /// Check if the cached proxy is about to expire (within threshold)
@@ -234,6 +314,67 @@ impl RotationProxyProvider {
         } else {
             true // No cache means we need to fetch
         }
+    }
+
+    /// Get a valid proxy with auto-rotation if TTL is below threshold
+    ///
+    /// This method checks if the current proxy is about to expire (within threshold_seconds).
+    /// If so, it automatically fetches a new proxy before returning.
+    /// Uses write lock to ensure only one request triggers rotation at a time.
+    ///
+    /// # Arguments
+    /// * `threshold_seconds` - Minimum remaining TTL before auto-rotation (default: 60s)
+    pub async fn get_valid_proxy(&self, threshold_seconds: u64) -> Result<CachedProxy, String> {
+        // First check with read lock - fast path for valid proxies
+        {
+            let cache = self.cache.read().await;
+            if let Some(ref cached) = *cache {
+                let expires_in = cached.expires_in_seconds();
+                if expires_in > threshold_seconds {
+                    debug!(
+                        "[RotationProxy] Proxy valid, expires in {}s (threshold: {}s)",
+                        expires_in, threshold_seconds
+                    );
+                    return Ok(cached.clone());
+                }
+                info!(
+                    "[RotationProxy] Proxy expiring soon ({}s <= {}s), auto-rotating...",
+                    expires_in, threshold_seconds
+                );
+            } else {
+                info!("[RotationProxy] No cached proxy, fetching new one");
+            }
+        }
+
+        // Proxy is expiring soon or doesn't exist - acquire write lock for rotation
+        let mut cache = self.cache.write().await;
+
+        // Double-check after acquiring write lock (another request might have rotated)
+        if let Some(ref cached) = *cache {
+            let expires_in = cached.expires_in_seconds();
+            if expires_in > threshold_seconds {
+                info!(
+                    "[RotationProxy] Proxy rotated by another request, using new proxy (expires in {}s)",
+                    expires_in
+                );
+                return Ok(cached.clone());
+            }
+        }
+
+        // Perform auto-rotation
+        info!(
+            "[RotationProxy] Auto-rotating proxy (threshold: {}s)",
+            threshold_seconds
+        );
+        let new_proxy = self.fetch_proxy().await?;
+        *cache = Some(new_proxy.clone());
+
+        info!(
+            "[RotationProxy] Auto-rotation complete, new proxy expires in {}s",
+            new_proxy.ttl_seconds
+        );
+
+        Ok(new_proxy)
     }
 
     /// Convert cached proxy to standard proxy URL
@@ -267,7 +408,10 @@ impl RotationProxyProvider {
 /// # URL Format
 /// `rotation://host?key=API_KEY&nhamang=NETWORK&tinhthanh=PROVINCE`
 fn parse_rotation_url(url: &str) -> Result<RotationConfig, String> {
+    debug!("[RotationProxy] Parsing rotation URL: {}", url);
+    
     if !url.starts_with("rotation://") {
+        error!("[RotationProxy] Invalid URL scheme: {}", url);
         return Err(format!(
             "Invalid rotation URL scheme. Expected rotation://, got: {}",
             url
@@ -275,18 +419,27 @@ fn parse_rotation_url(url: &str) -> Result<RotationConfig, String> {
     }
 
     // Parse as URL
-    let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {}", e))?;
+    let parsed = url::Url::parse(url).map_err(|e| {
+        error!("[RotationProxy] Failed to parse URL: {}", e);
+        format!("Failed to parse URL: {}", e)
+    })?;
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| "Missing host in rotation URL".to_string())?;
+        .ok_or_else(|| {
+            error!("[RotationProxy] Missing host in rotation URL");
+            "Missing host in rotation URL".to_string()
+        })?;
 
     let query_pairs: std::collections::HashMap<_, _> =
         parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
     let api_key = query_pairs
         .get("key")
-        .ok_or_else(|| "Missing 'key' parameter in rotation URL".to_string())?
+        .ok_or_else(|| {
+            error!("[RotationProxy] Missing 'key' parameter in rotation URL");
+            "Missing 'key' parameter in rotation URL".to_string()
+        })?
         .clone();
 
     let nhamang = query_pairs
@@ -304,6 +457,9 @@ fn parse_rotation_url(url: &str) -> Result<RotationConfig, String> {
         "https://{}/api/get.php?key={}&nhamang={}&tinhthanh={}",
         host, api_key, nhamang, tinhthanh
     );
+
+    info!("[RotationProxy] Parsed URL - host: {}, api_key: {}, nhamang: {}, tinhthanh: {}",
+          host, api_key.chars().take(8).collect::<String>() + "...", nhamang, tinhthanh);
 
     Ok(RotationConfig {
         api_url,
@@ -327,13 +483,14 @@ fn parse_ttl_from_message(message: &str) -> u64 {
     if let Some(captures) = re.captures(message) {
         if let Some(seconds_str) = captures.get(1) {
             if let Ok(seconds) = seconds_str.as_str().parse::<u64>() {
+                debug!("[RotationProxy] Parsed TTL {}s from message: {}", seconds, message);
                 return seconds;
             }
         }
     }
 
     // Default to 30 minutes if parsing fails
-    println!(
+    warn!(
         "[RotationProxy] Could not parse TTL from message: '{}', defaulting to 1800s",
         message
     );
@@ -401,18 +558,24 @@ fn parse_proxy_string(proxy_string: &str, protocol: &str) -> Option<String> {
         let pass = parts[3];
 
         if host.is_empty() || port.is_empty() {
+            warn!("[RotationProxy] Empty host or port in proxy string: {}", proxy_string);
             return None;
         }
 
         if user.is_empty() && pass.is_empty() {
-            return Some(format!("{}://{}:{}", protocol, host, port));
+            let result = format!("{}://{}:{}", protocol, host, port);
+            debug!("[RotationProxy] Parsed {} (no auth): {}", protocol, result);
+            return Some(result);
         }
 
         if user.is_empty() || pass.is_empty() {
+            warn!("[RotationProxy] Partial auth in proxy string: {}", proxy_string);
             return None;
         }
 
-        return Some(format!("{}://{}:{}@{}:{}", protocol, user, pass, host, port));
+        let result = format!("{}://{}:{}@{}:{}", protocol, user, pass, host, port);
+        debug!("[RotationProxy] Parsed {} proxy: {}@{}:{}", protocol, user, host, port);
+        return Some(result);
     }
 
     // Fallback support for host:port
@@ -421,13 +584,16 @@ fn parse_proxy_string(proxy_string: &str, protocol: &str) -> Option<String> {
         let port = parts[1];
 
         if host.is_empty() || port.is_empty() {
+            warn!("[RotationProxy] Empty host or port in proxy string: {}", proxy_string);
             return None;
         }
 
-        return Some(format!("{}://{}:{}", protocol, host, port));
+        let result = format!("{}://{}:{}", protocol, host, port);
+        debug!("[RotationProxy] Parsed {} proxy: {}", protocol, result);
+        return Some(result);
     }
 
-    println!(
+    error!(
         "[RotationProxy] Invalid proxy string format: expected host:port:user:pass or host:port::, got: {}",
         proxy_string
     );
@@ -514,6 +680,7 @@ mod tests {
         let cached = CachedProxy {
             http_proxy: "test".to_string(),
             socks5_proxy: "test".to_string(),
+            real_ip: "1.2.3.4".to_string(),
             expires_at: Instant::now() + Duration::from_secs(100),
             ttl_seconds: 100,
             created_at: Instant::now(),
@@ -529,6 +696,7 @@ mod tests {
         let cached = CachedProxy {
             http_proxy: "192.168.1.1:8080:user:pass".to_string(),
             socks5_proxy: "192.168.1.2:1080:user:pass".to_string(),
+            real_ip: "42.119.156.155".to_string(),
             expires_at: Instant::now() + Duration::from_secs(100),
             ttl_seconds: 100,
             created_at: Instant::now(),
@@ -544,6 +712,7 @@ mod tests {
         let cached = CachedProxy {
             http_proxy: "192.168.1.1:8080:user:pass".to_string(),
             socks5_proxy: ":".to_string(), // empty
+            real_ip: "42.119.156.155".to_string(),
             expires_at: Instant::now() + Duration::from_secs(100),
             ttl_seconds: 100,
             created_at: Instant::now(),

@@ -173,12 +173,14 @@ export function RotationStatus(props: RotationStatusProps) {
             ? {
                 ...prev,
                 currentProxy: data.proxy,
+                realIp: data.realIp ?? prev.realIp,
                 ttlSeconds: data.ttl,
                 expiresInSeconds: eventRemaining,
               }
             : {
                 active: true,
                 currentProxy: data.proxy,
+                realIp: data.realIp ?? "",
                 ttlSeconds: data.ttl,
                 expiresInSeconds: eventRemaining,
               },
@@ -249,8 +251,9 @@ export function RotationStatus(props: RotationStatusProps) {
         </div>
         <button
           class="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-brand-600 dark:hover:bg-brand-500"
-          disabled={isRotating()}
+          disabled={isRotating() || !status()?.active}
           onClick={handleForceRotate}
+          title={status()?.active ? "Rotate to a new proxy IP" : "Start the proxy first to enable rotation"}
         >
           <Show when={isRotating()}>
             <svg
@@ -293,9 +296,9 @@ export function RotationStatus(props: RotationStatusProps) {
       </div>
 
       <Show when={status()?.active}>
-        <div class="mt-4 grid grid-cols-3 gap-3">
+        <div class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
           <div class="rounded-lg bg-white p-2.5 shadow-sm dark:bg-gray-800">
-            <p class="text-xs text-gray-500 dark:text-gray-400">IP Address</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">Proxy IP</p>
             <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
               {proxy().ip}
             </p>
@@ -310,6 +313,12 @@ export function RotationStatus(props: RotationStatusProps) {
             <p class="text-xs text-gray-500 dark:text-gray-400">Protocol</p>
             <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
               {proxy().protocol.toUpperCase()}
+            </p>
+          </div>
+          <div class="rounded-lg bg-blue-50 p-2.5 shadow-sm dark:bg-blue-900/20">
+            <p class="text-xs text-blue-600 dark:text-blue-400">Real IP (External)</p>
+            <p class="mt-0.5 font-mono text-sm font-semibold text-blue-700 dark:text-blue-300">
+              {status()?.realIp || "-"}
             </p>
           </div>
         </div>
@@ -340,7 +349,7 @@ export function RotationStatus(props: RotationStatusProps) {
       <Show when={!status()?.active && !error()}>
         <div class="mt-4 rounded-lg bg-amber-50 p-3 dark:bg-amber-900/20">
           <p class="text-sm text-amber-800 dark:text-amber-200">
-            Waiting for rotation proxy to initialize...
+            <span class="font-semibold">Proxy not started.</span> Please click <span class="font-semibold">"Start Proxy"</span> button first to initialize the rotation proxy.
           </p>
         </div>
       </Show>

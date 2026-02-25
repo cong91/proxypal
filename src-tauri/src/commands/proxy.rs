@@ -1,5 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
+use log::{debug, error, info, warn};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 
@@ -25,7 +27,9 @@ const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
 
 /// Check if a URL is a rotation proxy URL
 fn is_rotation_url(url: &str) -> bool {
-    url.starts_with("rotation://")
+    let is_rotation = url.starts_with("rotation://");
+    debug!("[RotationProxy] is_rotation_url('{}') = {}", url, is_rotation);
+    is_rotation
 }
 
 /// Build proxy URL line for config YAML, handling rotation URLs
@@ -39,29 +43,36 @@ async fn build_proxy_url_line_with_rotation(
         config.proxy_url.clone()
     };
 
+    debug!("[RotationProxy] Building proxy URL line, effective_url='{}', use_system_proxy={}",
+           effective_proxy_url, config.use_system_proxy);
+
     if effective_proxy_url.is_empty() {
+        debug!("[RotationProxy] Empty effective proxy URL, returning empty line");
         return String::new();
     }
 
     // If rotation URL, resolve it using the provider
+    // Use get_valid_proxy with 60s threshold for auto-rotation before proxy expires
     let resolved_url = if is_rotation_url(&effective_proxy_url) {
+        info!("[RotationProxy] Rotation URL detected, resolving with auto-rotate (threshold: 60s)...");
         if let Some(prov) = provider {
-            match prov.get_or_refresh().await {
+            match prov.get_valid_proxy(60).await {
                 Ok(cached) => {
                     if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                        info!("[RotationProxy] Resolved to: {}", proxy_url);
                         proxy_url
                     } else {
-                        println!("[RotationProxy] Failed to resolve proxy URL, using direct connection");
+                        error!("[RotationProxy] Failed to resolve proxy URL from cached data");
                         return String::new();
                     }
                 }
                 Err(e) => {
-                    println!("[RotationProxy] Failed to fetch proxy: {}, using direct connection", e);
+                    error!("[RotationProxy] Failed to fetch proxy: {}, using direct connection", e);
                     return String::new();
                 }
             }
         } else {
-            println!("[RotationProxy] No provider available for rotation URL");
+            error!("[RotationProxy] No provider available for rotation URL");
             return String::new();
         }
     } else {
@@ -918,15 +929,25 @@ pub async fn start_proxy(
     if is_rotation && rotation_provider.is_some() {
         let provider = rotation_provider.unwrap();
         let app_handle = app.clone();
-        let log_watcher_running = state.log_watcher_running.clone();
+        let ttl_monitor_running = state.ttl_monitor_running.clone();
         let port = config.port;
         
+        // Signal any existing TTL monitor to stop first
+        state.ttl_monitor_running.store(false, Ordering::SeqCst);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        state.ttl_monitor_running.store(true, Ordering::SeqCst);
+        
         tokio::spawn(async move {
-            println!("[RotationProxy] Starting TTL monitor task");
+            println!("[RotationProxy] Starting TTL monitor task (sleep interval: 30s)");
             
-            while log_watcher_running.load(Ordering::SeqCst) {
-                // Check every 30 seconds
+            while ttl_monitor_running.load(Ordering::SeqCst) {
+                // Check every 30 seconds - CPU efficient, no busy-waiting
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                
+                // Double-check cancellation after sleep (avoid race condition)
+                if !ttl_monitor_running.load(Ordering::SeqCst) {
+                    break;
+                }
 
                 let current_cached = provider.get_cached().await;
                 let current_remaining = current_cached
@@ -1041,8 +1062,9 @@ pub async fn stop_proxy(
         }
     }
 
-    // Stop the log watcher (this also stops TTL monitor)
+    // Stop the log watcher and TTL monitor
     state.log_watcher_running.store(false, Ordering::SeqCst);
+    state.ttl_monitor_running.store(false, Ordering::SeqCst);
 
     // Kill the tracked child process
     {
@@ -1108,6 +1130,7 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
                 return Ok(RotationStatus {
                     active: true,
                     current_proxy: proxy_url,
+                    real_ip: cached.real_ip.clone(),
                     expires_in_seconds: cached.expires_in_seconds(),
                     ttl_seconds: cached.ttl_seconds,
                 });
@@ -1118,6 +1141,7 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
         return Ok(RotationStatus {
             active: true,
             current_proxy: String::new(),
+            real_ip: String::new(),
             expires_in_seconds: 0,
             ttl_seconds: 0,
         });
@@ -1133,6 +1157,8 @@ pub async fn force_rotate_proxy(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RotationStatus, String> {
+    info!("[RotationProxy][Manual] force_rotate_proxy command invoked");
+    
     let provider = state.rotation_provider.lock().unwrap().clone();
     
     if let Some(provider) = provider {
@@ -1148,8 +1174,9 @@ pub async fn force_rotate_proxy(
             .as_ref()
             .map(|cached| cached.expires_in_seconds())
             .unwrap_or(0);
-        println!(
-            "[RotationProxy][Manual] force_rotate requested: old_proxy='{}' old_remaining={}s",
+        
+        info!(
+            "[RotationProxy][Manual] Starting rotation: old_proxy='{}' old_remaining={}s",
             old_proxy, old_remaining
         );
 
@@ -1157,18 +1184,24 @@ pub async fn force_rotate_proxy(
         match provider.force_rotate().await {
             Ok(cached) => {
                 if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
-                    println!(
-                        "[RotationProxy][Manual] force_rotate result: old='{}' new='{}' changed={} expires_in={}s ttl={}s",
+                    let changed = old_proxy != proxy_url;
+                    info!(
+                        "[RotationProxy][Manual] Rotation successful: old='{}' new='{}' changed={} expires_in={}s ttl={}s",
                         old_proxy,
                         proxy_url,
-                        old_proxy != proxy_url,
+                        changed,
                         cached.expires_in_seconds(),
                         cached.ttl_seconds
                     );
 
                     // Update proxy via Management API
                     let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
-                    let client = reqwest::Client::new();
+                    debug!("[RotationProxy][Manual] Updating proxy via Management API: {}", update_url);
+                    
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
                     
                     match client
                         .put(&update_url)
@@ -1178,11 +1211,12 @@ pub async fn force_rotate_proxy(
                         .await
                     {
                         Ok(response) if response.status().is_success() => {
-                            println!("[RotationProxy] Force rotated proxy successfully");
+                            info!("[RotationProxy][Manual] Proxy updated via Management API successfully");
                             
                             // Emit event
                             let _ = app.emit("rotation-proxy-updated", serde_json::json!({
                                 "proxy": proxy_url,
+                                "realIp": cached.real_ip,
                                 "ttl": cached.ttl_seconds,
                                 "expiresInSeconds": cached.expires_in_seconds(),
                             }));
@@ -1190,22 +1224,29 @@ pub async fn force_rotate_proxy(
                             return Ok(RotationStatus {
                                 active: true,
                                 current_proxy: proxy_url,
+                                real_ip: cached.real_ip.clone(),
                                 expires_in_seconds: cached.expires_in_seconds(),
                                 ttl_seconds: cached.ttl_seconds,
                             });
                         }
                         Ok(response) => {
-                            return Err(format!("Management API returned error: {}", response.status()));
+                            let err_msg = format!("Management API returned error: {}", response.status());
+                            error!("[RotationProxy][Manual] {}", err_msg);
+                            return Err(err_msg);
                         }
                         Err(e) => {
-                            return Err(format!("Failed to update proxy via Management API: {}", e));
+                            let err_msg = format!("Failed to update proxy via Management API: {}", e);
+                            error!("[RotationProxy][Manual] {}", err_msg);
+                            return Err(err_msg);
                         }
                     }
                 } else {
+                    error!("[RotationProxy][Manual] Failed to resolve proxy URL from cached data");
                     return Err("Failed to resolve proxy URL".to_string());
                 }
             }
             Err(e) => {
+                error!("[RotationProxy][Manual] Rotation failed: {}", e);
                 let _ = app.emit("rotation-proxy-error", serde_json::json!({
                     "error": e,
                 }));
@@ -1214,7 +1255,8 @@ pub async fn force_rotate_proxy(
         }
     }
     
-    Err("No rotation proxy is active".to_string())
+    warn!("[RotationProxy][Manual] No rotation provider active");
+    Err("No rotation proxy is active. Please start the proxy first by clicking the 'Start Proxy' button.".to_string())
 }
 
 #[cfg(test)]

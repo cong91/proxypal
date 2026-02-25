@@ -11,6 +11,8 @@ export interface ProxyStatus {
 export interface RotationStatus {
   active: boolean;
   currentProxy: string;
+  /** Real external IP address (dynamic, changes on rotation) */
+  realIp: string;
   expiresInSeconds: number;
   ttlSeconds: number;
 }
@@ -55,11 +57,12 @@ export async function forceRotateProxy(): Promise<RotationStatus> {
 export async function onRotationProxyUpdated(
   callback: (data: {
     proxy: string;
+    realIp?: string;
     ttl: number;
     expiresInSeconds?: number;
   }) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ proxy: string; ttl: number; expiresInSeconds?: number }>(
+  return listen<{ proxy: string; realIp?: string; ttl: number; expiresInSeconds?: number }>(
     "rotation-proxy-updated",
     (event) => {
       callback(event.payload);

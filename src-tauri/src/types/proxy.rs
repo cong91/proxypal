@@ -31,6 +31,9 @@ pub struct RotationProxyResponse {
     pub proxy_socks5: String,
     #[serde(default, rename = "Token expiration date")]
     pub token_expiration: String,
+    /// Real external IP address (dynamic, changes on rotation)
+    #[serde(default)]
+    pub ip: String,
 }
 
 /// Cached proxy with expiration tracking
@@ -38,6 +41,8 @@ pub struct RotationProxyResponse {
 pub struct CachedProxy {
     pub http_proxy: String,
     pub socks5_proxy: String,
+    /// Real external IP address (dynamic, changes on rotation)
+    pub real_ip: String,
     pub expires_at: Instant,
     pub ttl_seconds: u64,
     pub created_at: Instant,
@@ -79,6 +84,8 @@ pub struct RotationConfig {
 pub struct RotationStatus {
     pub active: bool,
     pub current_proxy: String,
+    /// Real external IP address (the dynamic IP that changes on rotation)
+    pub real_ip: String,
     pub expires_in_seconds: u64,
     pub ttl_seconds: u64,
 }
@@ -88,6 +95,7 @@ impl Default for RotationStatus {
         Self {
             active: false,
             current_proxy: String::new(),
+            real_ip: String::new(),
             expires_in_seconds: 0,
             ttl_seconds: 0,
         }

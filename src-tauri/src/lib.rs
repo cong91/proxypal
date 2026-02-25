@@ -1,12 +1,16 @@
-mod commands;
-mod config;
-mod helpers;
-mod proxy;
-mod state;
-mod types;
-mod utils;
-mod ssh_manager;
-mod cloudflare_manager;
+pub mod commands;
+pub mod config;
+pub mod helpers;
+pub mod proxy;
+pub mod state;
+pub mod types;
+pub mod utils;
+pub mod ssh_manager;
+pub mod cloudflare_manager;
+
+// Re-export for testing binaries
+pub use proxy::RotationProxyProvider;
+pub use types::proxy::CachedProxy;
 
 use crate::config::{get_auth_path, load_config};
 use crate::helpers::migration::migrate_to_split_storage;
@@ -252,6 +256,7 @@ pub fn run() {
         log_watcher_running: Arc::new(AtomicBool::new(false)),
         request_counter: Arc::new(AtomicU64::new(0)),
         rotation_provider: Mutex::new(None),
+        ttl_monitor_running: Arc::new(AtomicBool::new(false)),
     };
 
     tauri::Builder::default()

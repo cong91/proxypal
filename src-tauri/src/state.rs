@@ -20,6 +20,8 @@ pub struct AppState {
     pub request_counter: Arc<AtomicU64>,
     /// Rotation proxy provider (when rotation:// URL is used)
     pub rotation_provider: Mutex<Option<Arc<RotationProxyProvider>>>,
+    /// TTL monitor cancellation flag (separate from log_watcher for clean shutdown)
+    pub ttl_monitor_running: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -35,6 +37,7 @@ impl Default for AppState {
             log_watcher_running: Arc::new(AtomicBool::new(false)),
             request_counter: Arc::new(AtomicU64::new(0)),
             rotation_provider: Mutex::new(None),
+            ttl_monitor_running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
