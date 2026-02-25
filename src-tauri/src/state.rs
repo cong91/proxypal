@@ -5,6 +5,7 @@ use tauri_plugin_shell::process::CommandChild;
 
 use crate::types::{ProxyStatus, AuthStatus, OAuthState, CopilotStatus};
 use crate::config::AppConfig;
+use crate::proxy::RotationProxyProvider;
 
 /// App state shared across all Tauri commands
 pub struct AppState {
@@ -17,6 +18,8 @@ pub struct AppState {
     pub copilot_process: Mutex<Option<CommandChild>>,
     pub log_watcher_running: Arc<AtomicBool>,
     pub request_counter: Arc<AtomicU64>,
+    /// Rotation proxy provider (when rotation:// URL is used)
+    pub rotation_provider: Mutex<Option<Arc<RotationProxyProvider>>>,
 }
 
 impl Default for AppState {
@@ -31,6 +34,7 @@ impl Default for AppState {
             copilot_process: Mutex::new(None),
             log_watcher_running: Arc::new(AtomicBool::new(false)),
             request_counter: Arc::new(AtomicU64::new(0)),
+            rotation_provider: Mutex::new(None),
         }
     }
 }

@@ -1,14 +1,16 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::types::ProxyStatus;
+use crate::types::{ProxyStatus, RotationStatus};
 use crate::helpers::log_watcher::start_log_watcher;
 use crate::get_management_key;
 use crate::GPT5_BASE_MODELS;
 use crate::GPT5_REASONING_SUFFIXES;
+use crate::proxy::RotationProxyProvider;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -20,6 +22,64 @@ use sysproxy::Sysproxy;
 use url::Url;
 
 const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
+
+/// Check if a URL is a rotation proxy URL
+fn is_rotation_url(url: &str) -> bool {
+    url.starts_with("rotation://")
+}
+
+/// Build proxy URL line for config YAML, handling rotation URLs
+async fn build_proxy_url_line_with_rotation(
+    config: &AppConfig,
+    provider: Option<&RotationProxyProvider>,
+) -> String {
+    let effective_proxy_url = if config.use_system_proxy {
+        get_system_proxy().ok().flatten().unwrap_or_default()
+    } else {
+        config.proxy_url.clone()
+    };
+
+    if effective_proxy_url.is_empty() {
+        return String::new();
+    }
+
+    // If rotation URL, resolve it using the provider
+    let resolved_url = if is_rotation_url(&effective_proxy_url) {
+        if let Some(prov) = provider {
+            match prov.get_or_refresh().await {
+                Ok(cached) => {
+                    if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                        proxy_url
+                    } else {
+                        println!("[RotationProxy] Failed to resolve proxy URL, using direct connection");
+                        return String::new();
+                    }
+                }
+                Err(e) => {
+                    println!("[RotationProxy] Failed to fetch proxy: {}, using direct connection", e);
+                    return String::new();
+                }
+            }
+        } else {
+            println!("[RotationProxy] No provider available for rotation URL");
+            return String::new();
+        }
+    } else {
+        effective_proxy_url
+    };
+
+    // Apply credentials if configured
+    let mut final_url = resolved_url;
+    if !config.proxy_username.is_empty() && !config.proxy_password.is_empty() {
+        if let Ok(mut url) = url::Url::parse(&final_url) {
+            let _ = url.set_username(&config.proxy_username);
+            let _ = url.set_password(Some(&config.proxy_password));
+            final_url = url.to_string();
+        }
+    }
+
+    format!("proxy-url: \"{}\"\n", final_url)
+}
 
 fn env_proxy_for_url(target_url: &str) -> Option<String> {
     let parsed = Url::parse(target_url).ok()?;
@@ -60,6 +120,109 @@ pub fn get_system_proxy() -> Result<Option<String>, String> {
 /// and appends user customizations from proxy-config-custom.yaml.
 fn build_proxy_config_yaml(config: &AppConfig, config_dir: &std::path::Path) -> Result<String, String> {
     let proxy_url_line = build_proxy_url_line(config);
+    let amp_api_key_line = build_amp_api_key_line(config);
+    let amp_model_mappings_section = build_amp_model_mappings_section(config);
+    let openai_compat_section = build_openai_compat_section(config);
+    let claude_api_key_section = build_claude_api_key_section(config);
+    let gemini_api_key_section = build_gemini_api_key_section(config);
+    let codex_api_key_section = build_codex_api_key_section(config);
+    let vertex_api_key_section = build_vertex_api_key_section(config);
+    let (thinking_budget, thinking_mode_display) = resolve_thinking_budget(config);
+    let payload_section = build_payload_section(config, thinking_budget, thinking_mode_display);
+    let routing_section = format!(
+        "# Routing strategy for multiple API keys\nrouting:\n  strategy: \"{}\"\n\n",
+        config.routing_strategy
+    );
+
+    let mut proxy_config = format!(
+        r#"# ProxyPal generated config
+port: {}
+auth-dir: "~/.cli-proxy-api"
+api-keys:
+  - "{}"
+debug: {}
+usage-statistics-enabled: {}
+logging-to-file: {}
+logs-max-total-size-mb: {}
+request-retry: {}
+max-retry-interval: {}
+{}
+# Quota exceeded behavior
+quota-exceeded:
+  switch-project: {}
+  switch-preview-model: {}
+
+# Enable Management API for OAuth flows
+remote-management:
+  allow-remote: true
+  secret-key: "{}"
+  disable-control-panel: {}
+
+{}{}{}{}{}{}{}# Amp CLI Integration - enables amp login and management routes
+# See: https://help.router-for.me/agent-client/amp-cli.html
+# Get API key from: https://ampcode.com/settings
+ampcode:
+  upstream-url: "https://ampcode.com"
+{}
+{}
+  restrict-management-to-localhost: false
+  force-model-mappings: {}
+
+# Additional settings
+request-log: {}
+commercial-mode: {}
+ws-auth: {}
+"#,
+        config.port,
+        config.proxy_api_key,
+        config.debug,
+        config.usage_stats_enabled,
+        config.logging_to_file,
+        config.logs_max_total_size_mb,
+        config.request_retry,
+        config.max_retry_interval,
+        proxy_url_line,
+        config.quota_switch_project,
+        config.quota_switch_preview_model,
+        config.management_key,
+        config.disable_control_panel,
+        openai_compat_section,
+        claude_api_key_section,
+        gemini_api_key_section,
+        codex_api_key_section,
+        vertex_api_key_section,
+        routing_section,
+        payload_section,
+        amp_api_key_line,
+        amp_model_mappings_section,
+        config.force_model_mappings,
+        config.request_logging,
+        config.commercial_mode,
+        config.ws_auth
+    );
+
+    // Append user customizations from proxy-config-custom.yaml if it exists
+    let custom_config_path = config_dir.join("proxy-config-custom.yaml");
+    if custom_config_path.exists() {
+        if let Ok(custom_yaml) = std::fs::read_to_string(&custom_config_path) {
+            if !custom_yaml.trim().is_empty() {
+                proxy_config.push_str("\n# User customizations (from proxy-config-custom.yaml)\n");
+                proxy_config.push_str(&custom_yaml);
+                proxy_config.push('\n');
+            }
+        }
+    }
+
+    Ok(proxy_config)
+}
+
+/// Async version of build_proxy_config_yaml that supports rotation URLs
+async fn build_proxy_config_yaml_async(
+    config: &AppConfig,
+    config_dir: &std::path::Path,
+    provider: Option<&RotationProxyProvider>,
+) -> Result<String, String> {
+    let proxy_url_line = build_proxy_url_line_with_rotation(config, provider).await;
     let amp_api_key_line = build_amp_api_key_line(config);
     let amp_model_mappings_section = build_amp_model_mappings_section(config);
     let openai_compat_section = build_openai_compat_section(config);
@@ -523,6 +686,38 @@ pub async fn start_proxy(
         }
     }
 
+    // Determine effective proxy URL
+    let effective_proxy_url = if config.use_system_proxy {
+        get_system_proxy().ok().flatten().unwrap_or_default()
+    } else {
+        config.proxy_url.clone()
+    };
+
+    // Check if using rotation proxy
+    let is_rotation = is_rotation_url(&effective_proxy_url);
+    
+    // Create rotation provider if needed
+    let rotation_provider: Option<Arc<RotationProxyProvider>> = if is_rotation {
+        println!("[RotationProxy] Detected rotation URL, initializing provider...");
+        match RotationProxyProvider::new(&effective_proxy_url) {
+            Ok(provider) => {
+                let provider = Arc::new(provider);
+                // Store provider in state
+                {
+                    let mut state_provider = state.rotation_provider.lock().unwrap();
+                    *state_provider = Some(provider.clone());
+                }
+                Some(provider)
+            }
+            Err(e) => {
+                println!("[RotationProxy] Failed to initialize provider: {}", e);
+                return Err(format!("Failed to initialize rotation proxy: {}", e));
+            }
+        }
+    } else {
+        None
+    };
+
     // Kill any existing tracked proxy process first
     {
         let mut process = state.proxy_process.lock().unwrap();
@@ -576,8 +771,12 @@ pub async fn start_proxy(
     
     let proxy_config_path = config_dir.join("proxy-config.yaml");
 
-    // Build YAML config and append user customizations
-    let proxy_config = build_proxy_config_yaml(&config, &config_dir)?;
+    // Build YAML config - use async version if rotation is enabled
+    let proxy_config = if is_rotation {
+        build_proxy_config_yaml_async(&config, &config_dir, rotation_provider.as_deref()).await?
+    } else {
+        build_proxy_config_yaml(&config, &config_dir)?
+    };
     std::fs::write(&proxy_config_path, proxy_config).map_err(|e| e.to_string())?;
 
     // Spawn the sidecar process with WRITABLE_PATH set to app config dir
@@ -715,6 +914,70 @@ pub async fn start_proxy(
             .await;
     });
 
+    // Start background TTL monitor for rotation proxy
+    if is_rotation && rotation_provider.is_some() {
+        let provider = rotation_provider.unwrap();
+        let app_handle = app.clone();
+        let log_watcher_running = state.log_watcher_running.clone();
+        let port = config.port;
+        
+        tokio::spawn(async move {
+            println!("[RotationProxy] Starting TTL monitor task");
+            
+            while log_watcher_running.load(Ordering::SeqCst) {
+                // Check every 30 seconds
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                
+                // Check if proxy is about to expire (within 60 seconds)
+                if provider.is_about_to_expire(60).await {
+                    println!("[RotationProxy] Proxy about to expire, rotating...");
+                    
+                    match provider.get_or_refresh().await {
+                        Ok(cached) => {
+                            if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                                // Update proxy via Management API
+                                let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
+                                let client = reqwest::Client::new();
+                                
+                                match client
+                                    .put(&update_url)
+                                    .header("X-Management-Key", &get_management_key())
+                                    .json(&serde_json::json!({"value": proxy_url}))
+                                    .send()
+                                    .await
+                                {
+                                    Ok(response) if response.status().is_success() => {
+                                        println!("[RotationProxy] Successfully rotated proxy via Management API");
+                                        // Emit event to frontend
+                                        let _ = app_handle.emit("rotation-proxy-updated", serde_json::json!({
+                                            "proxy": proxy_url,
+                                            "ttl": cached.ttl_seconds,
+                                        }));
+                                    }
+                                    Ok(response) => {
+                                        println!("[RotationProxy] Management API returned error: {}", response.status());
+                                        // Try restart fallback could be implemented here
+                                    }
+                                    Err(e) => {
+                                        println!("[RotationProxy] Failed to update proxy via Management API: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("[RotationProxy] Failed to fetch new proxy: {}", e);
+                            let _ = app_handle.emit("rotation-proxy-error", serde_json::json!({
+                                "error": e,
+                            }));
+                        }
+                    }
+                }
+            }
+            
+            println!("[RotationProxy] TTL monitor task stopped");
+        });
+    }
+
     // Update status
     let new_status = {
         let mut status = state.proxy_status.lock().unwrap();
@@ -726,6 +989,13 @@ pub async fn start_proxy(
 
     // Emit status update
     let _ = app.emit("proxy-status-changed", new_status.clone());
+    
+    // Emit rotation status if using rotation
+    if is_rotation {
+        let _ = app.emit("rotation-proxy-active", serde_json::json!({
+            "active": true,
+        }));
+    }
 
     Ok(new_status)
 }
@@ -743,7 +1013,7 @@ pub async fn stop_proxy(
         }
     }
 
-    // Stop the log watcher
+    // Stop the log watcher (this also stops TTL monitor)
     state.log_watcher_running.store(false, Ordering::SeqCst);
 
     // Kill the tracked child process
@@ -752,6 +1022,15 @@ pub async fn stop_proxy(
         if let Some(child) = process.take() {
             println!("[ProxyPal] Killing tracked proxy process");
             let _ = child.kill();
+        }
+    }
+
+    // Clear rotation provider
+    {
+        let mut provider = state.rotation_provider.lock().unwrap();
+        if provider.is_some() {
+            println!("[RotationProxy] Clearing rotation provider");
+            *provider = None;
         }
     }
 
@@ -781,8 +1060,109 @@ pub async fn stop_proxy(
 
     // Emit status update
     let _ = app.emit("proxy-status-changed", new_status.clone());
+    
+    // Emit rotation stopped event
+    let _ = app.emit("rotation-proxy-active", serde_json::json!({
+        "active": false,
+    }));
 
     Ok(new_status)
+}
+
+/// Get current rotation proxy status
+#[tauri::command]
+pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationStatus, String> {
+    let provider = state.rotation_provider.lock().unwrap().clone();
+    
+    if let Some(provider) = provider {
+        if let Some(cached) = provider.get_cached().await {
+            if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                return Ok(RotationStatus {
+                    active: true,
+                    current_proxy: proxy_url,
+                    expires_in_seconds: cached.expires_in_seconds(),
+                    ttl_seconds: cached.ttl_seconds,
+                });
+            }
+        }
+        
+        // Provider exists but no cached proxy yet
+        return Ok(RotationStatus {
+            active: true,
+            current_proxy: String::new(),
+            expires_in_seconds: 0,
+            ttl_seconds: 0,
+        });
+    }
+    
+    // No rotation provider
+    Ok(RotationStatus::default())
+}
+
+/// Force rotate the current proxy
+#[tauri::command]
+pub async fn force_rotate_proxy(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RotationStatus, String> {
+    let provider = state.rotation_provider.lock().unwrap().clone();
+    
+    if let Some(provider) = provider {
+        let config = state.config.lock().unwrap().clone();
+        let port = config.port;
+        
+        // Force rotate
+        match provider.force_rotate().await {
+            Ok(cached) => {
+                if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                    // Update proxy via Management API
+                    let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
+                    let client = reqwest::Client::new();
+                    
+                    match client
+                        .put(&update_url)
+                        .header("X-Management-Key", &get_management_key())
+                        .json(&serde_json::json!({"value": proxy_url}))
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {
+                            println!("[RotationProxy] Force rotated proxy successfully");
+                            
+                            // Emit event
+                            let _ = app.emit("rotation-proxy-updated", serde_json::json!({
+                                "proxy": proxy_url,
+                                "ttl": cached.ttl_seconds,
+                            }));
+                            
+                            return Ok(RotationStatus {
+                                active: true,
+                                current_proxy: proxy_url,
+                                expires_in_seconds: cached.expires_in_seconds(),
+                                ttl_seconds: cached.ttl_seconds,
+                            });
+                        }
+                        Ok(response) => {
+                            return Err(format!("Management API returned error: {}", response.status()));
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to update proxy via Management API: {}", e));
+                        }
+                    }
+                } else {
+                    return Err("Failed to resolve proxy URL".to_string());
+                }
+            }
+            Err(e) => {
+                let _ = app.emit("rotation-proxy-error", serde_json::json!({
+                    "error": e,
+                }));
+                return Err(format!("Failed to rotate proxy: {}", e));
+            }
+        }
+    }
+    
+    Err("No rotation proxy is active".to_string())
 }
 
 #[cfg(test)]
@@ -844,5 +1224,14 @@ mod tests {
             normalize_system_proxy("socks-proxy.local", 1080),
             "socks5://socks-proxy.local:1080"
         );
+    }
+
+    #[test]
+    fn is_rotation_url_detects_rotation_scheme() {
+        assert!(is_rotation_url("rotation://proxyxoay.shop?key=abc123"));
+        assert!(is_rotation_url("rotation://proxyprovider.com?key=xyz"));
+        assert!(!is_rotation_url("http://proxy.example.com:8080"));
+        assert!(!is_rotation_url("socks5://user:pass@proxy:1080"));
+        assert!(!is_rotation_url(""));
     }
 }

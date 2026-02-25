@@ -251,6 +251,7 @@ pub fn run() {
         copilot_process: Mutex::new(None),
         log_watcher_running: Arc::new(AtomicBool::new(false)),
         request_counter: Arc::new(AtomicU64::new(0)),
+        rotation_provider: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -348,6 +349,8 @@ pub fn run() {
             commands::models::get_gpt_reasoning_models,
             commands::proxy::start_proxy,
             commands::proxy::stop_proxy,
+            commands::proxy::get_rotation_status,
+            commands::proxy::force_rotate_proxy,
             // Copilot Management
             commands::copilot::get_copilot_status,
             commands::copilot::start_copilot,
