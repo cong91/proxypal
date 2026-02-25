@@ -1,11 +1,37 @@
 use std::sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::time::Instant;
 use tauri_plugin_shell::process::CommandChild;
 
 use crate::types::{ProxyStatus, AuthStatus, OAuthState, CopilotStatus};
 use crate::config::AppConfig;
 use crate::proxy::DynProxyProvider;
+
+/// Tracks the initialization state of rotation proxy
+#[derive(Debug, Clone)]
+pub enum RotationInitState {
+    /// Not initialized or not configured
+    Idle,
+    /// Initialization in progress
+    Initializing,
+    /// Successfully initialized with cached proxy
+    Initialized {
+        proxy_url: String,
+        expires_at: Instant,
+    },
+    /// Failed to initialize
+    Failed {
+        error: String,
+        retry_after: Option<Instant>,
+    },
+}
+
+impl Default for RotationInitState {
+    fn default() -> Self {
+        RotationInitState::Idle
+    }
+}
 
 /// App state shared across all Tauri commands
 pub struct AppState {
@@ -22,6 +48,8 @@ pub struct AppState {
     pub rotation_provider: Mutex<Option<DynProxyProvider>>,
     /// TTL monitor cancellation flag (separate from log_watcher for clean shutdown)
     pub ttl_monitor_running: Arc<AtomicBool>,
+    /// Rotation provider initialization state
+    pub rotation_init_state: Mutex<RotationInitState>,
 }
 
 impl Default for AppState {
@@ -38,6 +66,7 @@ impl Default for AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             rotation_provider: Mutex::new(None),
             ttl_monitor_running: Arc::new(AtomicBool::new(false)),
+            rotation_init_state: Mutex::new(RotationInitState::default()),
         }
     }
 }

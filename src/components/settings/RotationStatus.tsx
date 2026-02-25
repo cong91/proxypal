@@ -1,12 +1,14 @@
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, on, onCleanup, Show } from "solid-js";
 import {
   forceRotateProxy,
   getRotationStatus,
   onRotationProxyActive,
   onRotationProxyError,
+  onRotationProxyInitialized,
   onRotationProxyUpdated,
   type RotationStatus as RotationStatusType,
 } from "../../lib/tauri/proxy";
+import { rotationStore } from "../../stores/rotation";
 import { toastStore } from "../../stores/toast";
 
 interface RotationStatusProps {
@@ -14,10 +16,18 @@ interface RotationStatusProps {
 }
 
 export function RotationStatus(props: RotationStatusProps) {
-  const [status, setStatus] = createSignal<RotationStatusType | null>(null);
-  const [timeLeft, setTimeLeft] = createSignal(0);
+  // Initialize from cache for instant display
+  const cachedStatus = rotationStore.cachedState().status;
+  const cachedTimeLeft = cachedStatus?.expiresInSeconds ?? 0;
+  
+  const [status, setStatus] = createSignal<RotationStatusType | null>(cachedStatus);
+  const [timeLeft, setTimeLeft] = createSignal(cachedTimeLeft);
   const [isRotating, setIsRotating] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [initState, setInitState] = createSignal<
+    "idle" | "initializing" | "initialized" | "failed"
+  >(cachedStatus?.active ? "initialized" : "idle");
+  let fetchStatusSequence = 0;
 
   // Parse proxy URL to extract IP and Port
   const parseProxyUrl = (
@@ -79,22 +89,41 @@ export function RotationStatus(props: RotationStatusProps) {
   };
 
   // Fetch initial status
-  const fetchStatus = async () => {
+  const fetchStatus = async (reason = "unknown") => {
+    const seq = ++fetchStatusSequence;
+    const startedAt = performance.now();
+    console.debug("[RotationStatus] fetchStatus start", {
+      seq,
+      reason,
+      initState: initState(),
+      currentTimeLeft: timeLeft(),
+      hasStatus: !!status(),
+    });
+
     try {
       const rotationStatus = await getRotationStatus();
       console.debug("[RotationStatus] fetched status", {
+        seq,
+        reason,
         active: rotationStatus.active,
         currentProxy: rotationStatus.currentProxy,
         expiresInSeconds: rotationStatus.expiresInSeconds,
         ttlSeconds: rotationStatus.ttlSeconds,
+        durationMs: Math.round(performance.now() - startedAt),
       });
       setStatus(rotationStatus);
+      // Cache the status for instant display on remount
+      rotationStore.cacheStatus(rotationStatus);
       if (rotationStatus.active) {
         setTimeLeft(rotationStatus.expiresInSeconds);
         setError(null);
       }
     } catch (e) {
-      console.error("Failed to fetch rotation status:", e);
+      console.error("Failed to fetch rotation status:", e, {
+        seq,
+        reason,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
       setError(String(e));
     }
   };
@@ -125,100 +154,238 @@ export function RotationStatus(props: RotationStatusProps) {
     }
   };
 
-  // Setup effects and listeners
-  createEffect(() => {
-    if (!props.isActive) {
-      setStatus(null);
-      setTimeLeft(0);
-      return;
-    }
+  // Track previous isActive value to avoid unnecessary re-runs
+  const [wasActive, setWasActive] = createSignal(false);
 
-    // Fetch initial status
-    void fetchStatus();
-
-    // Setup interval countdown
-    const countdownInterval = setInterval(() => {
-      setTimeLeft((prev) => {
-        if (prev <= 0) {
-          // Auto-refresh when expired
-          void fetchStatus();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    // Setup Tauri event listeners
-    let unlistenUpdated: (() => void) | null = null;
-    let unlistenError: (() => void) | null = null;
-    let unlistenActive: (() => void) | null = null;
-
-    const setupListeners = async () => {
-      unlistenUpdated = await onRotationProxyUpdated((data) => {
-        const previousProxy = status()?.currentProxy || "";
-        const eventRemaining = Math.max(
-          0,
-          Math.floor(data.expiresInSeconds ?? data.ttl),
-        );
-        console.debug("[RotationStatus] rotation-proxy-updated event", {
-          previousProxy,
-          newProxy: data.proxy,
-          changed: previousProxy !== data.proxy,
-          ttl: data.ttl,
-          expiresInSeconds: data.expiresInSeconds,
-          eventRemaining,
+  // Setup effects and listeners - use 'on' to explicitly track only props.isActive
+  createEffect(
+    on(
+      () => props.isActive,
+      (isActive) => {
+        console.debug("[RotationStatus] effect run", {
+          isActive,
+          wasActive: wasActive(),
+          hasCachedStatus: !!rotationStore.cachedState().status,
+          cachedActive: rotationStore.cachedState().status?.active,
         });
-        setStatus((prev) =>
-          prev
-            ? {
-                ...prev,
-                currentProxy: data.proxy,
-                realIp: data.realIp ?? prev.realIp,
-                ttlSeconds: data.ttl,
-                expiresInSeconds: eventRemaining,
-              }
-            : {
-                active: true,
-                currentProxy: data.proxy,
-                realIp: data.realIp ?? "",
-                ttlSeconds: data.ttl,
-                expiresInSeconds: eventRemaining,
-              },
-        );
-        setTimeLeft(eventRemaining);
-        setError(null);
-      });
 
-      unlistenError = await onRotationProxyError((data) => {
-        console.debug("[RotationStatus] rotation-proxy-error event", data);
-        setError(data.error);
-        toastStore.error("Rotation proxy error", data.error);
-      });
-
-      unlistenActive = await onRotationProxyActive((data) => {
-        console.debug("[RotationStatus] rotation-proxy-active event", data);
-        if (!data.active) {
-          setStatus(null);
-          setTimeLeft(0);
+        if (!isActive) {
+          // Don't reset state when inactive - keep cache for instant display when re-activating
+          setWasActive(false);
+          return;
         }
-      });
-    };
 
-    void setupListeners();
+        // Only setup if transitioning from inactive to active
+        if (wasActive()) {
+          return;
+        }
+        setWasActive(true);
 
-    // Periodic status refresh every 30 seconds
-    const refreshInterval = setInterval(() => {
-      void fetchStatus();
-    }, 30000);
+        // Check if we have cached status - if so, display immediately without blocking
+        const currentCached = rotationStore.cachedState().status;
+        if (currentCached?.active && currentCached?.currentProxy) {
+          console.debug("[RotationStatus] Using cached status for instant display");
+          // Always update status from cache to ensure we have the latest data
+          setStatus(currentCached);
+          setTimeLeft(currentCached.expiresInSeconds);
+          setInitState("initialized");
+          setError(null);
+        } else {
+          // No valid cache, need to initialize
+          setInitState("initializing");
+        }
 
-    onCleanup(() => {
-      clearInterval(countdownInterval);
-      clearInterval(refreshInterval);
-      unlistenUpdated?.();
-      unlistenError?.();
-      unlistenActive?.();
-    });
-  });
+        // Setup interval countdown (only when status is active)
+        const countdownInterval = setInterval(() => {
+          // Chỉ countdown khi đã initialized thành công
+          if (initState() !== "initialized") return;
+
+          setTimeLeft((prev) => {
+            if (prev <= 0) {
+              // Chỉ fetch khi đã có status active — tránh fetch rỗng
+              if (status()?.active && status()?.currentProxy) {
+                void fetchStatus("countdown<=0");
+              }
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+
+        // Setup Tauri event listeners
+        let unlistenUpdated: (() => void) | null = null;
+        let unlistenError: (() => void) | null = null;
+        let unlistenActive: (() => void) | null = null;
+        let unlistenInitialized: (() => void) | null = null;
+
+        // Abort guard để tránh memory leak khi unmount giữa chừng
+        let aborted = false;
+
+        const setupListeners = async () => {
+          // 1. Đăng ký TẤT CẢ listeners TRƯỚC
+          unlistenUpdated = await onRotationProxyUpdated((data) => {
+            const previousProxy = status()?.currentProxy || "";
+            const eventRemaining = Math.max(
+              0,
+              Math.floor(data.expiresInSeconds ?? data.ttl),
+            );
+            console.debug("[RotationStatus] rotation-proxy-updated event", {
+              previousProxy,
+              newProxy: data.proxy,
+              changed: previousProxy !== data.proxy,
+              ttl: data.ttl,
+              expiresInSeconds: data.expiresInSeconds,
+              eventRemaining,
+            });
+            const newStatus = status()
+              ? {
+                  ...status()!,
+                  currentProxy: data.proxy,
+                  realIp: data.realIp ?? status()!.realIp,
+                  ttlSeconds: data.ttl,
+                  expiresInSeconds: eventRemaining,
+                }
+              : {
+                  active: true,
+                  currentProxy: data.proxy,
+                  realIp: data.realIp ?? "",
+                  ttlSeconds: data.ttl,
+                  expiresInSeconds: eventRemaining,
+                };
+            setStatus(newStatus);
+            // Cache the updated status
+            rotationStore.cacheStatus(newStatus);
+            setTimeLeft(eventRemaining);
+            setError(null);
+            setInitState("initialized");
+          });
+          if (aborted) {
+            unlistenUpdated();
+            return;
+          }
+
+          unlistenError = await onRotationProxyError((data) => {
+            console.debug("[RotationStatus] rotation-proxy-error event", data);
+            setError(data.error);
+            toastStore.error("Rotation proxy error", data.error);
+          });
+          if (aborted) {
+            unlistenError();
+            unlistenUpdated?.();
+            return;
+          }
+
+          unlistenActive = await onRotationProxyActive((data) => {
+            console.debug("[RotationStatus] rotation-proxy-active event", data);
+            if (!data.active) {
+              setStatus(null);
+              setTimeLeft(0);
+              setInitState("idle");
+              // Note: We intentionally DON'T clear cache here so that
+              // the component can display cached data instantly when re-activated
+            }
+          });
+          if (aborted) {
+            unlistenActive();
+            unlistenError?.();
+            unlistenUpdated?.();
+            return;
+          }
+
+          // Listen for initialization event from background task
+          unlistenInitialized = await onRotationProxyInitialized((data) => {
+            console.debug(
+              "[RotationStatus] rotation-proxy-initialized event",
+              data,
+            );
+            if (data.success) {
+              const newStatus = {
+                active: true,
+                currentProxy: data.proxy ?? "",
+                realIp: data.realIp ?? "",
+                ttlSeconds: data.ttl ?? 0,
+                expiresInSeconds: data.expiresInSeconds ?? 0,
+              };
+              setStatus(newStatus);
+              // Cache the initialized status
+              rotationStore.cacheStatus(newStatus);
+              setTimeLeft(data.expiresInSeconds ?? 0);
+              setError(null);
+              setInitState("initialized");
+              toastStore.success("Proxy rotation initialized");
+            } else {
+              setError(data.error ?? "Initialization failed");
+              setInitState("failed");
+              toastStore.error(
+                "Proxy rotation initialization failed",
+                data.error ?? "Unknown error",
+              );
+            }
+          });
+          if (aborted) {
+            unlistenInitialized();
+            unlistenActive?.();
+            unlistenError?.();
+            unlistenUpdated?.();
+            return;
+          }
+
+          // 2. CATCH-UP: Sau khi listeners sẵn sàng, kiểm tra trạng thái hiện tại
+          //    để xử lý trường hợp event đã phát trước khi listeners đăng ký
+          console.debug(
+            "[RotationStatus] Listeners ready, performing catch-up fetch",
+          );
+          try {
+            const currentStatus = await getRotationStatus();
+            console.debug("[RotationStatus] Catch-up status", currentStatus);
+
+            // Always cache the fetched status for future reference
+            rotationStore.cacheStatus(currentStatus);
+
+            // Chỉ cập nhật UI nếu component vẫn đang ở trạng thái initializing
+            // (nếu event đã đến qua listener, initState sẽ là "initialized")
+            // Hoặc nếu fetched status khác với cached status
+            const currentCached = status();
+            const hasMeaningfulChange =
+              !currentCached ||
+              currentCached.currentProxy !== currentStatus.currentProxy ||
+              currentCached.active !== currentStatus.active;
+            
+            if (
+              (initState() === "initializing" || hasMeaningfulChange) &&
+              currentStatus.active &&
+              currentStatus.currentProxy
+            ) {
+              console.debug(
+                "[RotationStatus] Catch-up: found active proxy, updating state",
+              );
+              setStatus(currentStatus);
+              setTimeLeft(currentStatus.expiresInSeconds);
+              setError(null);
+              setInitState("initialized");
+            }
+          } catch (e) {
+            console.warn("[RotationStatus] Catch-up fetch failed:", e);
+            // Không set error — listener vẫn có thể nhận event sau
+            // Và cached data (nếu có) vẫn được hiển thị
+          }
+        };
+
+        void setupListeners();
+
+        onCleanup(() => {
+          aborted = true; // Signal cho async setup dừng lại
+          clearInterval(countdownInterval);
+          unlistenUpdated?.();
+          unlistenError?.();
+          unlistenActive?.();
+          unlistenInitialized?.();
+        });
+      },
+      // Removed { defer: true } to ensure effect runs immediately on mount
+      // This fixes the issue where isActive is already true when component mounts
+    ),
+  );
 
   const proxy = () => parseProxyUrl(status()?.currentProxy || "");
   const isExpired = () => timeLeft() <= 0 && status()?.active;
@@ -253,7 +420,11 @@ export function RotationStatus(props: RotationStatusProps) {
           class="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-brand-600 dark:hover:bg-brand-500"
           disabled={isRotating() || !status()?.active}
           onClick={handleForceRotate}
-          title={status()?.active ? "Rotate to a new proxy IP" : "Start the proxy first to enable rotation"}
+          title={
+            status()?.active
+              ? "Rotate to a new proxy IP"
+              : "Start the proxy first to enable rotation"
+          }
         >
           <Show when={isRotating()}>
             <svg
@@ -318,28 +489,32 @@ export function RotationStatus(props: RotationStatusProps) {
           </div>
         </Show>
         <div class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div class="rounded-lg bg-white p-2.5 shadow-sm dark:bg-gray-800">
-            <p class="text-xs text-gray-500 dark:text-gray-400">Proxy IP</p>
-            <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
-              {proxy().ip}
+          {/* Current IP - ô nổi bật nhất */}
+          <div class="rounded-lg bg-blue-50 p-2.5 shadow-sm dark:bg-blue-900/20">
+            <p class="text-xs text-blue-600 dark:text-blue-400">Current IP</p>
+            <p class="mt-0.5 font-mono text-sm font-semibold text-blue-700 dark:text-blue-300">
+              {status()?.realIp || proxy().ip || "-"}
             </p>
           </div>
+          {/* Proxy Server */}
           <div class="rounded-lg bg-white p-2.5 shadow-sm dark:bg-gray-800">
-            <p class="text-xs text-gray-500 dark:text-gray-400">Port</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">Proxy Server</p>
             <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
-              {proxy().port}
+              {proxy().ip}:{proxy().port}
             </p>
           </div>
+          {/* Protocol */}
           <div class="rounded-lg bg-white p-2.5 shadow-sm dark:bg-gray-800">
             <p class="text-xs text-gray-500 dark:text-gray-400">Protocol</p>
             <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
               {proxy().protocol.toUpperCase()}
             </p>
           </div>
-          <div class="rounded-lg bg-blue-50 p-2.5 shadow-sm dark:bg-blue-900/20">
-            <p class="text-xs text-blue-600 dark:text-blue-400">Real IP (External)</p>
-            <p class="mt-0.5 font-mono text-sm font-semibold text-blue-700 dark:text-blue-300">
-              {status()?.realIp || "-"}
+          {/* TTL Info */}
+          <div class="rounded-lg bg-white p-2.5 shadow-sm dark:bg-gray-800">
+            <p class="text-xs text-gray-500 dark:text-gray-400">TTL</p>
+            <p class="mt-0.5 font-mono text-sm font-medium text-gray-900 dark:text-gray-100">
+              {status()?.ttlSeconds ? `${status()!.ttlSeconds}s` : "-"}
             </p>
           </div>
         </div>
@@ -369,9 +544,46 @@ export function RotationStatus(props: RotationStatusProps) {
 
       <Show when={!status()?.active && !error()}>
         <div class="mt-4 rounded-lg bg-amber-50 p-3 dark:bg-amber-900/20">
-          <p class="text-sm text-amber-800 dark:text-amber-200">
-            <span class="font-semibold">Proxy not started.</span> Please click <span class="font-semibold">"Start Proxy"</span> button first to initialize the rotation proxy.
-          </p>
+          <Show
+            when={initState() === "initializing"}
+            fallback={
+              <p class="text-sm text-amber-800 dark:text-amber-200">
+                <span class="font-semibold">Proxy not started.</span> Please
+                click <span class="font-semibold">"Start Proxy"</span> button
+                first to initialize the rotation proxy.
+              </p>
+            }
+          >
+            <div class="flex items-center gap-2">
+              <svg
+                class="h-4 w-4 animate-spin text-amber-600 dark:text-amber-400"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle
+                  class="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  stroke-width="4"
+                />
+                <path
+                  class="opacity-75"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  fill="currentColor"
+                />
+              </svg>
+              <p class="text-sm text-amber-800 dark:text-amber-200">
+                <span class="font-semibold">
+                  Initializing proxy rotation...
+                </span>
+                <span class="text-xs text-amber-700 dark:text-amber-300 block">
+                  Fetching initial proxy from provider
+                </span>
+              </p>
+            </div>
+          </Show>
         </div>
       </Show>
 

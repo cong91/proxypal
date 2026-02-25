@@ -1,12 +1,12 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::{debug, error, info, warn};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 
 use crate::config::AppConfig;
-use crate::state::AppState;
+use crate::state::{AppState, RotationInitState};
 use crate::types::{ProxyStatus, RotationStatus, RotationProxySettings, ProviderMetadata};
 use crate::types::proxy::{ProviderInfo, NetworkOption, LocationOption};
 use crate::helpers::log_watcher::start_log_watcher;
@@ -32,6 +32,46 @@ fn is_rotation_url(url: &str) -> bool {
     debug!("[RotationProxy] is_rotation_url('{}') = {}", url, is_rotation);
     is_rotation
 }
+
+/// Helper function to create a new rotation provider and store it in state
+/// If a provider already exists in state, it will NOT be overwritten (preserves auto-init cache)
+fn create_rotation_provider(
+    url: &str,
+    state: &State<'_, AppState>,
+) -> Result<Option<Arc<RotationProxyProvider>>, String> {
+    // Check if provider already exists in state (from auto-initialization)
+    // If so, don't overwrite it - preserve the cache
+    {
+        let existing = state.rotation_provider.lock().unwrap();
+        if existing.is_some() {
+            info!("[RotationProxy] Provider already exists in state, preserving auto-init cache");
+            // Create a new provider instance for type compatibility
+            // The existing provider in state will be used for actual proxy operations
+            let provider = Arc::new(RotationProxyProvider::new(url)?);
+            return Ok(Some(provider));
+        }
+    }
+    
+    info!("[RotationProxy] Creating new provider for URL: {}", url);
+    match RotationProxyProvider::new(url) {
+        Ok(provider) => {
+            let provider = Arc::new(provider);
+            // Store provider in state only if not already present
+            {
+                let mut state_provider = state.rotation_provider.lock().unwrap();
+                if state_provider.is_none() {
+                    *state_provider = Some(provider.clone());
+                }
+            }
+            Ok(Some(provider))
+        }
+        Err(e) => {
+            error!("[RotationProxy] Failed to initialize provider: {}", e);
+            Err(format!("Failed to initialize rotation proxy: {}", e))
+        }
+    }
+}
+
 
 /// Build proxy URL line for config YAML, handling rotation URLs
 async fn build_proxy_url_line_with_rotation(
@@ -708,22 +748,52 @@ pub async fn start_proxy(
     // Check if using rotation proxy
     let is_rotation = is_rotation_url(&effective_proxy_url);
     
-    // Create rotation provider if needed
+    // Get or create rotation provider if needed
+    // Note: When existing provider is present (from auto-init), we still create a local instance
+    // for type compatibility, but create_rotation_provider will NOT overwrite the state provider
     let rotation_provider: Option<Arc<RotationProxyProvider>> = if is_rotation {
-        println!("[RotationProxy] Detected rotation URL, initializing provider...");
-        match RotationProxyProvider::new(&effective_proxy_url) {
-            Ok(provider) => {
-                let provider = Arc::new(provider);
-                // Store provider in state
-                {
-                    let mut state_provider = state.rotation_provider.lock().unwrap();
-                    *state_provider = Some(provider.clone());
+        // First check if provider already exists in state (from auto-initialization)
+        let existing_provider = {
+            let state_provider = state.rotation_provider.lock().unwrap();
+            state_provider.clone()
+        };
+        
+        if existing_provider.is_some() {
+            info!("[RotationProxy] Using pre-initialized provider from state (cache preserved)");
+            // Provider exists - create local instance for this function's use
+            // State provider is preserved by create_rotation_provider
+            match RotationProxyProvider::new(&effective_proxy_url) {
+                Ok(provider) => Some(Arc::new(provider)),
+                Err(e) => {
+                    error!("[RotationProxy] Failed to create local provider instance: {}", e);
+                    return Err(format!("Failed to initialize rotation proxy: {}", e));
                 }
-                Some(provider)
             }
-            Err(e) => {
-                println!("[RotationProxy] Failed to initialize provider: {}", e);
-                return Err(format!("Failed to initialize rotation proxy: {}", e));
+        } else {
+            // No existing provider, check init state
+            let init_state = state.rotation_init_state.lock().unwrap().clone();
+            match init_state {
+                RotationInitState::Initializing => {
+                    info!("[RotationProxy] Initialization in progress, waiting briefly...");
+                    // Wait a short time for initialization to complete
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    // Try again
+                    let state_provider = state.rotation_provider.lock().unwrap();
+                    if state_provider.is_some() {
+                        info!("[RotationProxy] Provider now available after waiting");
+                        create_rotation_provider(&effective_proxy_url, &state)?
+                    } else {
+                        create_rotation_provider(&effective_proxy_url, &state)?
+                    }
+                }
+                RotationInitState::Failed { error, .. } => {
+                    warn!("[RotationProxy] Previous initialization failed: {}, retrying...", error);
+                    create_rotation_provider(&effective_proxy_url, &state)?
+                }
+                _ => {
+                    // Idle or other states - create new provider
+                    create_rotation_provider(&effective_proxy_url, &state)?
+                }
             }
         }
     } else {
@@ -927,8 +997,8 @@ pub async fn start_proxy(
     });
 
     // Start background TTL monitor for rotation proxy
-    if is_rotation && rotation_provider.is_some() {
-        let provider = rotation_provider.unwrap();
+    if is_rotation {
+        if let Some(provider) = rotation_provider {
         let app_handle = app.clone();
         let ttl_monitor_running = state.ttl_monitor_running.clone();
         let port = config.port;
@@ -980,8 +1050,8 @@ pub async fn start_proxy(
 
                 // Check if proxy is about to expire (within 60 seconds) or we need to retry after failure
                 let needs_rotation = if consecutive_failures > 0 {
-                    // After a failure, wait at least 60s before retrying (provider cooldown)
-                    false // Handled by backoff interval above
+                    // After failure, still check expiration but allow rotation if expired
+                    provider.is_about_to_expire(60).await || current_remaining == 0
                 } else {
                     provider.is_about_to_expire(60).await
                 };
@@ -1063,6 +1133,7 @@ pub async fn start_proxy(
             
             println!("[RotationProxy] TTL monitor task stopped");
         });
+        }
     }
 
     // Update status
@@ -1160,11 +1231,29 @@ pub async fn stop_proxy(
 /// Get current rotation proxy status
 #[tauri::command]
 pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationStatus, String> {
+    let command_started = Instant::now();
+    let provider_lock_started = Instant::now();
     let provider = state.rotation_provider.lock().unwrap().clone();
-    
+    let provider_lock_ms = provider_lock_started.elapsed().as_millis();
+
+    info!(
+        "[RotationProxy][Status] get_rotation_status start provider_exists={} provider_lock={}ms",
+        provider.is_some(),
+        provider_lock_ms
+    );
+
     if let Some(provider) = provider {
+        let cached_read_started = Instant::now();
         if let Some(cached) = provider.get_cached().await {
+            let cached_read_ms = cached_read_started.elapsed().as_millis();
             if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                info!(
+                    "[RotationProxy][Status] cache hit expires_in={}s ttl={}s cached_read={}ms total={}ms",
+                    cached.expires_in_seconds(),
+                    cached.ttl_seconds,
+                    cached_read_ms,
+                    command_started.elapsed().as_millis()
+                );
                 return Ok(RotationStatus {
                     active: true,
                     provider_id: Some("proxy_vn".to_string()),
@@ -1176,7 +1265,12 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
                 });
             }
         }
-        
+
+        info!(
+            "[RotationProxy][Status] provider exists but cache empty/unresolved total={}ms",
+            command_started.elapsed().as_millis()
+        );
+
         // Provider exists but no cached proxy yet
         return Ok(RotationStatus {
             active: true,
@@ -1188,7 +1282,12 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
             ttl_seconds: 0,
         });
     }
-    
+
+    info!(
+        "[RotationProxy][Status] no rotation provider total={}ms",
+        command_started.elapsed().as_millis()
+    );
+
     // No rotation provider
     Ok(RotationStatus::default())
 }

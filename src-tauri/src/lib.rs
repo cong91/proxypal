@@ -11,6 +11,7 @@ pub mod cloudflare_manager;
 // Re-export for testing binaries
 pub use proxy::{RotationProxyProvider, ProxyProviderFactory, DynProxyProvider, ProxyProvider};
 pub use types::proxy::{CachedProxy, RotationProxySettings, ProviderMetadata, ProviderInfo};
+pub use state::RotationInitState;
 
 use crate::config::{get_auth_path, load_config};
 use crate::helpers::migration::migrate_to_split_storage;
@@ -257,6 +258,7 @@ pub fn run() {
         request_counter: Arc::new(AtomicU64::new(0)),
         rotation_provider: Mutex::new(None),
         ttl_monitor_running: Arc::new(AtomicBool::new(false)),
+        rotation_init_state: Mutex::new(RotationInitState::default()),
     };
 
     tauri::Builder::default()
@@ -346,6 +348,10 @@ pub fn run() {
                     }
                 }
             });
+
+            // Auto-initialize proxy rotation in background
+            let app_handle = app.handle().clone();
+            crate::proxy::ProxyRotationInitializer::new().initialize(app_handle);
 
             Ok(())
         })

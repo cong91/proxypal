@@ -1,4 +1,4 @@
-import { createEffect, createSignal, Show, splitProps } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show, splitProps } from "solid-js";
 import { useI18n } from "../../i18n";
 import {
   getLogSize,
@@ -13,8 +13,8 @@ import { toastStore } from "../../stores/toast";
 import { ProviderSelector } from "./ProviderSelector";
 import { RotationStatus } from "./RotationStatus";
 
-import type { SettingsBaseProps } from "./types";
 import type { RotationProxySettings } from "../../lib/tauri/proxy";
+import type { SettingsBaseProps } from "./types";
 
 interface ProxySettingsProps extends SettingsBaseProps {
   proxyRunning: boolean;
@@ -60,24 +60,145 @@ export function ProxySettings(props: ProxySettingsProps) {
   const [savingMaxRetryInterval, setSavingMaxRetryInterval] =
     createSignal(false);
   const [savingLogSize, setSavingLogSize] = createSignal(false);
+  let settingsLoadSeq = 0;
+  const [hasLoaded, setHasLoaded] = createSignal(false);
 
-  createEffect(async () => {
-    if (!local.proxyRunning) {
-      return;
+  // Local signals for immediate UI updates (debounced save to backend)
+  const [proxyUrlInput, setProxyUrlInput] = createSignal(
+    local.config().proxyUrl || "",
+  );
+  const [proxyUsernameInput, setProxyUsernameInput] = createSignal(
+    local.config().proxyUsername || "",
+  );
+  const [proxyPasswordInput, setProxyPasswordInput] = createSignal(
+    local.config().proxyPassword || "",
+  );
+  const [proxyApiKeyInput, setProxyApiKeyInput] = createSignal(
+    local.config().proxyApiKey || "proxypal-local",
+  );
+  const [managementKeyInput, setManagementKeyInput] = createSignal(
+    local.config().managementKey || "proxypal-mgmt-key",
+  );
+
+  // Debounce timers for text inputs
+  let proxyUrlTimer: number | undefined;
+  let proxyUsernameTimer: number | undefined;
+  let proxyPasswordTimer: number | undefined;
+  let proxyApiKeyTimer: number | undefined;
+  let managementKeyTimer: number | undefined;
+
+  // Debounced handlers for text inputs
+  const handleProxyUrlChange = (value: string) => {
+    setProxyUrlInput(value);
+    if (proxyUrlTimer) clearTimeout(proxyUrlTimer);
+    proxyUrlTimer = window.setTimeout(() => {
+      local.handleConfigChange("proxyUrl", value);
+    }, 500);
+  };
+
+  const handleProxyUsernameChange = (value: string) => {
+    setProxyUsernameInput(value);
+    if (proxyUsernameTimer) clearTimeout(proxyUsernameTimer);
+    proxyUsernameTimer = window.setTimeout(() => {
+      local.handleConfigChange("proxyUsername", value);
+    }, 500);
+  };
+
+  const handleProxyPasswordChange = (value: string) => {
+    setProxyPasswordInput(value);
+    if (proxyPasswordTimer) clearTimeout(proxyPasswordTimer);
+    proxyPasswordTimer = window.setTimeout(() => {
+      local.handleConfigChange("proxyPassword", value);
+    }, 500);
+  };
+
+  const handleProxyApiKeyChange = (value: string) => {
+    setProxyApiKeyInput(value);
+    if (proxyApiKeyTimer) clearTimeout(proxyApiKeyTimer);
+    proxyApiKeyTimer = window.setTimeout(() => {
+      local.handleConfigChange("proxyApiKey", value || "proxypal-local");
+    }, 500);
+  };
+
+  const handleManagementKeyChange = (value: string) => {
+    setManagementKeyInput(value);
+    if (managementKeyTimer) clearTimeout(managementKeyTimer);
+    managementKeyTimer = window.setTimeout(() => {
+      local.handleConfigChange("managementKey", value || "proxypal-mgmt-key");
+    }, 500);
+  };
+
+  // Cleanup timers on unmount
+  onCleanup(() => {
+    if (proxyUrlTimer) clearTimeout(proxyUrlTimer);
+    if (proxyUsernameTimer) clearTimeout(proxyUsernameTimer);
+    if (proxyPasswordTimer) clearTimeout(proxyPasswordTimer);
+    if (proxyApiKeyTimer) clearTimeout(proxyApiKeyTimer);
+    if (managementKeyTimer) clearTimeout(managementKeyTimer);
+  });
+
+  // Sync local inputs from config when component mounts or config changes
+  // This ensures values are displayed correctly when user navigates back to Settings
+  createEffect(() => {
+    const currentConfig = local.config();
+    // Only update if not currently being edited (no active timer)
+    if (!proxyUrlTimer) {
+      setProxyUrlInput(currentConfig.proxyUrl || "");
     }
+    if (!proxyUsernameTimer) {
+      setProxyUsernameInput(currentConfig.proxyUsername || "");
+    }
+    if (!proxyPasswordTimer) {
+      setProxyPasswordInput(currentConfig.proxyPassword || "");
+    }
+    if (!proxyApiKeyTimer) {
+      setProxyApiKeyInput(currentConfig.proxyApiKey || "proxypal-local");
+    }
+    if (!managementKeyTimer) {
+      setManagementKeyInput(currentConfig.managementKey || "proxypal-mgmt-key");
+    }
+  });
+
+  // Fetch proxy settings from backend - called only when needed, not in effect
+  const fetchProxySettings = async (): Promise<void> => {
+    const seq = ++settingsLoadSeq;
+    const startedAt = performance.now();
+    console.debug("[ProxySettings] fetch start", { seq });
+
+    setHasLoaded(true);
 
     try {
       const interval = await getMaxRetryInterval();
       setMaxRetryIntervalState(interval);
+      console.debug("[ProxySettings] getMaxRetryInterval done", {
+        seq,
+        interval,
+      });
     } catch (error) {
-      console.error("Failed to fetch max retry interval:", error);
+      console.error("Failed to fetch max retry interval:", error, { seq });
     }
 
     try {
       const size = await getLogSize();
       setLogSizeState(size);
+      console.debug("[ProxySettings] getLogSize done", {
+        seq,
+        size,
+      });
     } catch (error) {
-      console.error("Failed to fetch log size:", error);
+      console.error("Failed to fetch log size:", error, { seq });
+    }
+
+    console.debug("[ProxySettings] fetch done", {
+      seq,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+  };
+
+  // Fetch initial data on mount if proxy is running
+  onMount(() => {
+    if (local.proxyRunning && !hasLoaded()) {
+      void fetchProxySettings();
     }
   });
 
@@ -177,12 +298,10 @@ export function ProxySettings(props: ProxySettingsProps) {
             </span>
             <input
               class="transition-smooth mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-              onInput={(e) =>
-                local.handleConfigChange("proxyUrl", e.currentTarget.value)
-              }
+              onInput={(e) => handleProxyUrlChange(e.currentTarget.value)}
               placeholder="socks5://127.0.0.1:1080"
               type="text"
-              value={local.config().proxyUrl}
+              value={proxyUrlInput()}
             />
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Optional SOCKS5/HTTP proxy for outbound requests (e.g.
@@ -199,16 +318,38 @@ export function ProxySettings(props: ProxySettingsProps) {
         <Show when={isRotationProxyUrl(effectiveProxyUrl())}>
           <ProviderSelector
             rotationUrl={effectiveProxyUrl()}
+            initialSettings={local.config().rotationSettings}
             onUrlChange={(url) => {
-              local.handleConfigChange("proxyUrl", url);
+              // Update local input immediately and debounce save
+              setProxyUrlInput(url);
+              if (proxyUrlTimer) clearTimeout(proxyUrlTimer);
+              proxyUrlTimer = window.setTimeout(() => {
+                local.handleConfigChange("proxyUrl", url);
+              }, 500);
             }}
             onSettingsChange={(settings: RotationProxySettings | undefined) => {
-              if (settings) {
-                const currentConfig = local.config();
+              const currentConfig = local.config();
+              const currentSettings = currentConfig.rotationSettings;
+
+              // Guard: only update if settings actually changed
+              let settingsChanged: boolean;
+              if (settings === undefined) {
+                settingsChanged = currentSettings !== undefined;
+              } else if (currentSettings === undefined || currentSettings === null) {
+                settingsChanged = true;
+              } else {
+                settingsChanged =
+                  currentSettings.providerId !== settings.providerId ||
+                  currentSettings.apiKey !== settings.apiKey ||
+                  currentSettings.networkType !== settings.networkType ||
+                  currentSettings.locationFilter !== settings.locationFilter;
+              }
+
+              if (settingsChanged) {
                 local.setConfig({
                   ...currentConfig,
                   rotationSettings: settings,
-                  rotationProviderId: settings.providerId,
+                  rotationProviderId: settings?.providerId,
                 });
               }
             }}
@@ -227,12 +368,10 @@ export function ProxySettings(props: ProxySettingsProps) {
             </span>
             <input
               class="transition-smooth mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-              onInput={(e) =>
-                local.handleConfigChange("proxyUsername", e.currentTarget.value)
-              }
+              onInput={(e) => handleProxyUsernameChange(e.currentTarget.value)}
               placeholder="Optional"
               type="text"
-              value={local.config().proxyUsername || ""}
+              value={proxyUsernameInput()}
             />
           </label>
           <label class="block">
@@ -243,14 +382,11 @@ export function ProxySettings(props: ProxySettingsProps) {
               <input
                 class="transition-smooth block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 pr-10 text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
                 onInput={(e) =>
-                  local.handleConfigChange(
-                    "proxyPassword",
-                    e.currentTarget.value,
-                  )
+                  handleProxyPasswordChange(e.currentTarget.value)
                 }
                 placeholder="Optional"
                 type={showProxyPassword() ? "text" : "password"}
-                value={local.config().proxyPassword || ""}
+                value={proxyPasswordInput()}
               />
               <button
                 class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
@@ -306,15 +442,10 @@ export function ProxySettings(props: ProxySettingsProps) {
           <div class="relative mt-1">
             <input
               class="transition-smooth block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 pr-10 font-mono text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-              onInput={(e) =>
-                local.handleConfigChange(
-                  "proxyApiKey",
-                  e.currentTarget.value || "proxypal-local",
-                )
-              }
+              onInput={(e) => handleProxyApiKeyChange(e.currentTarget.value)}
               placeholder="proxypal-local"
               type={showProxyApiKey() ? "text" : "password"}
-              value={local.config().proxyApiKey || "proxypal-local"}
+              value={proxyApiKeyInput()}
             />
             <button
               class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
@@ -373,15 +504,10 @@ export function ProxySettings(props: ProxySettingsProps) {
           <div class="relative mt-1">
             <input
               class="transition-smooth block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 pr-10 font-mono text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-              onInput={(e) =>
-                local.handleConfigChange(
-                  "managementKey",
-                  e.currentTarget.value || "proxypal-mgmt-key",
-                )
-              }
+              onInput={(e) => handleManagementKeyChange(e.currentTarget.value)}
               placeholder="proxypal-mgmt-key"
               type={showManagementKey() ? "text" : "password"}
-              value={local.config().managementKey || "proxypal-mgmt-key"}
+              value={managementKeyInput()}
             />
             <button
               class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"

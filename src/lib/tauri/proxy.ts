@@ -96,12 +96,14 @@ export async function onRotationProxyUpdated(
     expiresInSeconds?: number;
   }) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ proxy: string; realIp?: string; ttl: number; expiresInSeconds?: number }>(
-    "rotation-proxy-updated",
-    (event) => {
-      callback(event.payload);
-    },
-  );
+  return listen<{
+    proxy: string;
+    realIp?: string;
+    ttl: number;
+    expiresInSeconds?: number;
+  }>("rotation-proxy-updated", (event) => {
+    callback(event.payload);
+  });
 }
 
 export async function onRotationProxyError(
@@ -120,15 +122,41 @@ export async function onRotationProxyActive(
   });
 }
 
+export async function onRotationProxyInitialized(
+  callback: (data: {
+    success: boolean;
+    proxy?: string;
+    realIp?: string;
+    ttl?: number;
+    expiresInSeconds?: number;
+    error?: string;
+  }) => void,
+): Promise<UnlistenFn> {
+  return listen<{
+    success: boolean;
+    proxy?: string;
+    realIp?: string;
+    ttl?: number;
+    expiresInSeconds?: number;
+    error?: string;
+  }>("rotation-proxy-initialized", (event) => {
+    callback(event.payload);
+  });
+}
+
 // Multi-provider proxy rotation API
 export async function getAvailableRotationProviders(): Promise<ProviderInfo[]> {
   return invoke("get_available_rotation_providers");
 }
 
-export async function getProviderMetadata(providerId: string): Promise<ProviderMetadata> {
+export async function getProviderMetadata(
+  providerId: string,
+): Promise<ProviderMetadata> {
   return invoke("get_provider_metadata", { providerId });
 }
 
-export async function updateRotationSettings(settings: RotationProxySettings): Promise<void> {
+export async function updateRotationSettings(
+  settings: RotationProxySettings,
+): Promise<void> {
   return invoke("update_rotation_settings", { settings });
 }

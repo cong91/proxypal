@@ -8,6 +8,7 @@
 //! - `trait.rs`: Defines the [`ProxyProvider`] trait (Strategy Pattern)
 //! - `base.rs`: Contains [`ProxyProviderBase`] with common caching logic
 //! - `factory.rs`: Factory pattern for creating providers
+//! - `initializer.rs`: Auto-initialization on app startup
 //! - `providers/`: Concrete provider implementations
 //!
 //! ## Usage
@@ -33,11 +34,13 @@ pub mod trait_ext;
 pub mod base;
 pub mod factory;
 pub mod providers;
+pub mod initializer;
 
 // Re-export core types
 pub use trait_ext::{ProxyProvider, DynProxyProvider};
 pub use base::ProxyProviderBase;
 pub use factory::ProxyProviderFactory;
+pub use initializer::ProxyRotationInitializer;
 
 // Re-export providers
 pub use providers::ProxyVNProvider;
