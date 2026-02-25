@@ -4,7 +4,6 @@ version = "0.4.5"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
-default-run = "proxypal"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,18 +13,6 @@ default-run = "proxypal"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "proxypal_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-
-[[bin]]
-name = "proxypal"
-path = "src/main.rs"
-
-[[bin]]
-name = "test_rotation"
-path = "src/bin/test_rotation.rs"
-
-[[bin]]
-name = "test_ssl"
-path = "src/bin/test_ssl.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -53,15 +40,12 @@ tokio = { version = "1", features = [
 dirs = "5"
 rand = "0.8"
 url = "2"
-reqwest = { version = "0.12", features = ["json", "multipart", "blocking", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
 chrono = "0.4"
 regex = "1"
 lazy_static = "1"
-async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-fs = "2.4.4"
 sysproxy = "0.3.0"
 env_proxy = "0.4.1"
-log = "0.4"
-urlencoding = "2.1"
 
