@@ -927,14 +927,41 @@ pub async fn start_proxy(
             while log_watcher_running.load(Ordering::SeqCst) {
                 // Check every 30 seconds
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                
+
+                let current_cached = provider.get_cached().await;
+                let current_remaining = current_cached
+                    .as_ref()
+                    .map(|cached| cached.expires_in_seconds())
+                    .unwrap_or(0);
+                println!(
+                    "[RotationProxy][TTL] Tick: remaining={}s threshold=60s",
+                    current_remaining
+                );
+
                 // Check if proxy is about to expire (within 60 seconds)
                 if provider.is_about_to_expire(60).await {
-                    println!("[RotationProxy] Proxy about to expire, rotating...");
-                    
-                    match provider.get_or_refresh().await {
+                    println!(
+                        "[RotationProxy] Proxy about to expire, rotating... remaining={}s",
+                        current_remaining
+                    );
+
+                    let old_proxy = current_cached
+                        .as_ref()
+                        .and_then(RotationProxyProvider::resolve_proxy_url)
+                        .unwrap_or_default();
+
+                    match provider.force_rotate().await {
                         Ok(cached) => {
                             if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                                println!(
+                                    "[RotationProxy][TTL] Rotation candidate: old='{}' new='{}' changed={} expires_in={}s ttl={}s",
+                                    old_proxy,
+                                    proxy_url,
+                                    old_proxy != proxy_url,
+                                    cached.expires_in_seconds(),
+                                    cached.ttl_seconds
+                                );
+
                                 // Update proxy via Management API
                                 let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
                                 let client = reqwest::Client::new();
@@ -952,6 +979,7 @@ pub async fn start_proxy(
                                         let _ = app_handle.emit("rotation-proxy-updated", serde_json::json!({
                                             "proxy": proxy_url,
                                             "ttl": cached.ttl_seconds,
+                                            "expiresInSeconds": cached.expires_in_seconds(),
                                         }));
                                     }
                                     Ok(response) => {
@@ -1111,10 +1139,33 @@ pub async fn force_rotate_proxy(
         let config = state.config.lock().unwrap().clone();
         let port = config.port;
         
+        let old_cached = provider.get_cached().await;
+        let old_proxy = old_cached
+            .as_ref()
+            .and_then(RotationProxyProvider::resolve_proxy_url)
+            .unwrap_or_default();
+        let old_remaining = old_cached
+            .as_ref()
+            .map(|cached| cached.expires_in_seconds())
+            .unwrap_or(0);
+        println!(
+            "[RotationProxy][Manual] force_rotate requested: old_proxy='{}' old_remaining={}s",
+            old_proxy, old_remaining
+        );
+
         // Force rotate
         match provider.force_rotate().await {
             Ok(cached) => {
                 if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
+                    println!(
+                        "[RotationProxy][Manual] force_rotate result: old='{}' new='{}' changed={} expires_in={}s ttl={}s",
+                        old_proxy,
+                        proxy_url,
+                        old_proxy != proxy_url,
+                        cached.expires_in_seconds(),
+                        cached.ttl_seconds
+                    );
+
                     // Update proxy via Management API
                     let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
                     let client = reqwest::Client::new();
@@ -1133,6 +1184,7 @@ pub async fn force_rotate_proxy(
                             let _ = app.emit("rotation-proxy-updated", serde_json::json!({
                                 "proxy": proxy_url,
                                 "ttl": cached.ttl_seconds,
+                                "expiresInSeconds": cached.expires_in_seconds(),
                             }));
                             
                             return Ok(RotationStatus {

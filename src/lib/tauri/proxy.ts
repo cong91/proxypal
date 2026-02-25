@@ -53,9 +53,13 @@ export async function forceRotateProxy(): Promise<RotationStatus> {
 }
 
 export async function onRotationProxyUpdated(
-  callback: (data: { proxy: string; ttl: number }) => void,
+  callback: (data: {
+    proxy: string;
+    ttl: number;
+    expiresInSeconds?: number;
+  }) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ proxy: string; ttl: number }>(
+  return listen<{ proxy: string; ttl: number; expiresInSeconds?: number }>(
     "rotation-proxy-updated",
     (event) => {
       callback(event.payload);

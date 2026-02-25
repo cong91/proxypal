@@ -82,6 +82,12 @@ export function RotationStatus(props: RotationStatusProps) {
   const fetchStatus = async () => {
     try {
       const rotationStatus = await getRotationStatus();
+      console.debug("[RotationStatus] fetched status", {
+        active: rotationStatus.active,
+        currentProxy: rotationStatus.currentProxy,
+        expiresInSeconds: rotationStatus.expiresInSeconds,
+        ttlSeconds: rotationStatus.ttlSeconds,
+      });
       setStatus(rotationStatus);
       if (rotationStatus.active) {
         setTimeLeft(rotationStatus.expiresInSeconds);
@@ -98,7 +104,15 @@ export function RotationStatus(props: RotationStatusProps) {
     setIsRotating(true);
     setError(null);
     try {
+      const oldProxy = status()?.currentProxy || "";
       const newStatus = await forceRotateProxy();
+      console.debug("[RotationStatus] force rotate result", {
+        oldProxy,
+        newProxy: newStatus.currentProxy,
+        changed: oldProxy !== newStatus.currentProxy,
+        expiresInSeconds: newStatus.expiresInSeconds,
+        ttlSeconds: newStatus.ttlSeconds,
+      });
       setStatus(newStatus);
       setTimeLeft(newStatus.expiresInSeconds);
       toastStore.success("Proxy rotated successfully");
@@ -141,26 +155,46 @@ export function RotationStatus(props: RotationStatusProps) {
 
     const setupListeners = async () => {
       unlistenUpdated = await onRotationProxyUpdated((data) => {
+        const previousProxy = status()?.currentProxy || "";
+        const eventRemaining = Math.max(
+          0,
+          Math.floor(data.expiresInSeconds ?? data.ttl),
+        );
+        console.debug("[RotationStatus] rotation-proxy-updated event", {
+          previousProxy,
+          newProxy: data.proxy,
+          changed: previousProxy !== data.proxy,
+          ttl: data.ttl,
+          expiresInSeconds: data.expiresInSeconds,
+          eventRemaining,
+        });
         setStatus((prev) =>
           prev
-            ? { ...prev, currentProxy: data.proxy, ttlSeconds: data.ttl }
+            ? {
+                ...prev,
+                currentProxy: data.proxy,
+                ttlSeconds: data.ttl,
+                expiresInSeconds: eventRemaining,
+              }
             : {
                 active: true,
                 currentProxy: data.proxy,
                 ttlSeconds: data.ttl,
-                expiresInSeconds: data.ttl,
+                expiresInSeconds: eventRemaining,
               },
         );
-        setTimeLeft(data.ttl);
+        setTimeLeft(eventRemaining);
         setError(null);
       });
 
       unlistenError = await onRotationProxyError((data) => {
+        console.debug("[RotationStatus] rotation-proxy-error event", data);
         setError(data.error);
         toastStore.error("Rotation proxy error", data.error);
       });
 
       unlistenActive = await onRotationProxyActive((data) => {
+        console.debug("[RotationStatus] rotation-proxy-active event", data);
         if (!data.active) {
           setStatus(null);
           setTimeLeft(0);
