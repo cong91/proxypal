@@ -3193,7 +3193,6 @@ dependencies = [
  "dirs 5.0.1",
  "env_proxy",
  "lazy_static 1.5.0",
- "log 0.4.29",
  "rand 0.8.5",
  "regex 1.12.3",
  "reqwest 0.12.28",
