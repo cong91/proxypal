@@ -7,6 +7,21 @@ import {
   Show,
   untrack,
 } from "solid-js";
+
+// Deep equality check for rotation settings
+function rotationSettingsEqual(
+  a: RotationProxySettings | undefined,
+  b: RotationProxySettings | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.providerId === b.providerId &&
+    a.apiKey === b.apiKey &&
+    a.networkType === b.networkType &&
+    a.locationFilter === b.locationFilter
+  );
+}
 import { useI18n } from "../../i18n";
 import {
   getAvailableRotationProviders,
@@ -124,6 +139,10 @@ export function ProviderSelector(props: ProviderSelectorProps) {
   // Track if we're currently syncing to avoid loops
   const [isSyncingFromUrl, setIsSyncingFromUrl] = createSignal(false);
 
+  // Track last notified settings to avoid redundant callbacks
+  const [lastNotifiedSettings, setLastNotifiedSettings] =
+    createSignal<RotationProxySettings | undefined>(undefined);
+
   // Load providers on mount
   const loadProviders = async () => {
     try {
@@ -189,14 +208,22 @@ export function ProviderSelector(props: ProviderSelectorProps) {
           setNetworkType(parsed.networkType || "random");
           setLocationFilter(parsed.locationFilter || "0");
 
-          // Notify parent of parsed settings
-          props.onSettingsChange?.(parsed);
+          // Only notify parent if settings actually changed
+          const lastNotified = untrack(lastNotifiedSettings);
+          if (!rotationSettingsEqual(parsed, lastNotified)) {
+            setLastNotifiedSettings(parsed);
+            props.onSettingsChange?.(parsed);
+          }
 
           // Reset syncing flag after a tick
           setTimeout(() => setIsSyncingFromUrl(false), 0);
         } else {
           // URL is not a valid rotation URL
-          props.onSettingsChange?.(undefined);
+          const lastNotified = untrack(lastNotifiedSettings);
+          if (lastNotified !== undefined) {
+            setLastNotifiedSettings(undefined);
+            props.onSettingsChange?.(undefined);
+          }
         }
       },
       { defer: true },
@@ -240,8 +267,12 @@ export function ProviderSelector(props: ProviderSelectorProps) {
       props.onUrlChange(newUrl);
     }
 
-    // Notify parent of settings change
-    props.onSettingsChange?.(settings);
+    // Only notify parent if settings actually changed
+    const lastNotified = untrack(lastNotifiedSettings);
+    if (!rotationSettingsEqual(settings, lastNotified)) {
+      setLastNotifiedSettings(settings);
+      props.onSettingsChange?.(settings);
+    }
   };
 
   // Handlers that sync to URL

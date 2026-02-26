@@ -10,7 +10,6 @@ struct ProviderEntry {
     factory: fn(&str) -> Result<DynProxyProvider, String>,
 }
 
-/// Registry của các available providers
 lazy_static! {
     static ref PROVIDER_REGISTRY: HashMap<&'static str, ProviderEntry> = {
         let mut m = HashMap::new();

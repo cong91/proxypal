@@ -254,9 +254,10 @@ impl ProxyProvider for ProxyVNProvider {
                             "[ProxyVN] Provider cooldown detected: {}s remaining. Returning immediately without blocking.",
                             wait_seconds
                         );
+                        // Return error with [WAITING_STATUS] marker for initializer to parse
                         return Err(format!(
-                            "Proxy rotation on cooldown. Please wait {} seconds before rotating again.",
-                            wait_seconds
+                            "[WAITING_STATUS]{}|Proxy rotation on cooldown. Please wait {} seconds before rotating again.",
+                            wait_seconds, wait_seconds
                         ));
                     }
 

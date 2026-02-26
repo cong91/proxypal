@@ -86,7 +86,7 @@ pub async fn set_thinking_budget_settings(
         let config = state.config.lock().unwrap();
         config.clone()
     };
-    crate::commands::config::save_config(state, config_to_save)?;
+    crate::commands::config::save_config(state, config_to_save).await?;
 
     // Config is saved - proxy will pick up new thinking budget on next request
 
@@ -132,7 +132,7 @@ pub async fn set_reasoning_effort_settings(
         let config = state.config.lock().unwrap();
         config.clone()
     };
-    crate::commands::config::save_config(state, config_to_save)?;
+    crate::commands::config::save_config(state, config_to_save).await?;
 
     Ok(())
 }
@@ -160,7 +160,7 @@ pub async fn set_close_to_tray(
         let config = state.config.lock().unwrap();
         config.clone()
     };
-    crate::commands::config::save_config(state, config_to_save)?;
+    crate::commands::config::save_config(state, config_to_save).await?;
     Ok(())
 }
 

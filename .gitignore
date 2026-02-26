@@ -42,6 +42,3 @@ src-tauri/logs/
 
 # bv (beads viewer) local config and caches
 .bv/
-.roo/
-.specify/
-.user_rules/
