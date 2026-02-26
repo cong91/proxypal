@@ -43,6 +43,9 @@ fn main() {
             println!(
                 "cargo:warning=Sidecar binary not available, using placeholder for check-only build"
             );
+            // Skip tauri_build::build() to avoid PermissionDenied on Windows
+            println!("cargo:warning=Skipping tauri_build::build() for check-only mode");
+            return;
         } else if is_ci {
             panic!(
                 "Sidecar binary missing or corrupted in CI: {}.\n\
@@ -54,6 +57,13 @@ fn main() {
             println!("cargo:warning=Downloading sidecar from CLIProxyAPI releases...");
             download_binary(&binary_name, &binaries_dir);
         }
+    }
+
+    // Skip tauri_build::build() in check-only mode to avoid PermissionDenied on Windows
+    // when the sidecar binary is locked by antivirus or other processes
+    if is_check_only {
+        println!("cargo:warning=Skipping tauri_build::build() for check-only mode");
+        return;
     }
 
     tauri_build::build()

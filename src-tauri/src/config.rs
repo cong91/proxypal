@@ -347,7 +347,8 @@ pub(crate) fn save_config_to_path(path: &Path, config: &AppConfig) -> Result<(),
                         attempt + 1,
                         e
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // Giảm từ 100ms xuống 50ms — vì đã chạy trên blocking thread
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }

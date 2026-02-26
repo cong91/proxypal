@@ -170,6 +170,13 @@ pub async fn set_close_to_tray(
 
 // Get max retry interval from Management API
 #[tauri::command]
+// DEBUG: Commented out for bisection testing - returns default value
+pub async fn get_max_retry_interval(_state: State<'_, AppState>) -> Result<i32, String> {
+    info!("[Settings][Runtime] get_max_retry_interval SKIPPED (DEBUG MODE)");
+    Ok(0) // Default value
+}
+
+/* ORIGINAL CODE:
 pub async fn get_max_retry_interval(state: State<'_, AppState>) -> Result<i32, String> {
     let port = state.config.lock().unwrap().port;
     let url = get_management_url(port, "max-retry-interval");
@@ -189,6 +196,7 @@ pub async fn get_max_retry_interval(state: State<'_, AppState>) -> Result<i32, S
     let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
     Ok(json["max-retry-interval"].as_i64().unwrap_or(0) as i32)
 }
+*/
 
 // Set max retry interval via Management API
 #[tauri::command]
@@ -227,6 +235,13 @@ pub async fn set_max_retry_interval(
 
 // Get log size from Management API
 #[tauri::command]
+// DEBUG: Commented out for bisection testing - returns default value
+pub async fn get_log_size(_state: State<'_, AppState>) -> Result<u32, String> {
+    info!("[Settings][Runtime] get_log_size SKIPPED (DEBUG MODE)");
+    Ok(500) // Default value
+}
+
+/* ORIGINAL CODE:
 pub async fn get_log_size(state: State<'_, AppState>) -> Result<u32, String> {
     let port = state.config.lock().unwrap().port;
     let url = get_management_url(port, "log-size");
@@ -246,6 +261,7 @@ pub async fn get_log_size(state: State<'_, AppState>) -> Result<u32, String> {
     let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
     Ok(json["log-size"].as_u64().unwrap_or(500) as u32)
 }
+*/
 
 // Set log size via Management API
 #[tauri::command]

@@ -1,5 +1,13 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import { AdvancedSettings } from "../components/settings/AdvancedSettings";
 import { AmpSettings } from "../components/settings/AmpSettings";
 import { ClaudeCodeSettings } from "../components/settings/ClaudeCodeSettings";
@@ -13,7 +21,13 @@ import { ThinkingReasoningSettings } from "../components/settings/ThinkingReason
 import { Button, Switch } from "../components/ui";
 import { LOCALE_LABELS, LOCALE_OPTIONS, useI18n } from "../i18n";
 
-type SettingsTab = "general" | "providers" | "models" | "advanced" | "ssh" | "cloudflare";
+type SettingsTab =
+  | "general"
+  | "providers"
+  | "models"
+  | "advanced"
+  | "ssh"
+  | "cloudflare";
 
 import {
   type AgentConfigResult,
@@ -37,10 +51,16 @@ export function SettingsPage() {
   const [activeTab, setActiveTab] = createSignal<SettingsTab>("general");
   const [appVersion, setAppVersion] = createSignal("0.0.0");
 
+  // Debounced save state
+  let saveTimer: number | undefined;
+  let pendingConfig: ReturnType<typeof config> | null = null;
+
   // GPT base models fetched from backend (single source of truth)
   const [gptBaseModels, setGptBaseModels] = createSignal<string[]>([]);
   const gptBaseModelSet = createMemo(() => new Set(gptBaseModels()));
-  const [availableModels, setAvailableModels] = createSignal<AvailableModel[]>([]);
+  const [availableModels, setAvailableModels] = createSignal<AvailableModel[]>(
+    [],
+  );
 
   // Handle navigation from other components (e.g., CopilotCard)
   createEffect(() => {
@@ -107,7 +127,10 @@ export function SettingsPage() {
       );
       setConfigResult(null);
     } catch (error) {
-      toastStore.error(t("settings.toasts.failedToUpdateShellProfile"), String(error));
+      toastStore.error(
+        t("settings.toasts.failedToUpdateShellProfile"),
+        String(error),
+      );
     }
   };
 
@@ -270,18 +293,24 @@ export function SettingsPage() {
       google: models
         .filter((m) => m.ownedBy === "google" || m.ownedBy === "antigravity")
         .map((m) => ({ label: m.id, value: m.id })),
-      iflow: models.filter((m) => m.ownedBy === "iflow").map((m) => ({ label: m.id, value: m.id })),
+      iflow: models
+        .filter((m) => m.ownedBy === "iflow")
+        .map((m) => ({ label: m.id, value: m.id })),
       kimi: models
         .filter((m) => m.ownedBy === "kimi" || m.id.startsWith("kimi-"))
         .map((m) => ({ label: m.id, value: m.id })),
       openai: models
         .filter((m) => m.ownedBy === "openai")
         .map((m) => ({ label: m.id, value: m.id })),
-      qwen: models.filter((m) => m.ownedBy === "qwen").map((m) => ({ label: m.id, value: m.id })),
+      qwen: models
+        .filter((m) => m.ownedBy === "qwen")
+        .map((m) => ({ label: m.id, value: m.id })),
       // GitHub Copilot models (via copilot-api) - includes both GPT and Claude models
       copilot: models
         .filter(
-          (m) => m.ownedBy === "copilot" || (m.ownedBy === "claude" && m.id.startsWith("copilot-")),
+          (m) =>
+            m.ownedBy === "copilot" ||
+            (m.ownedBy === "claude" && m.id.startsWith("copilot-")),
         )
         .map((m) => ({ label: m.id, value: m.id })),
       // Kiro models (Amazon's AI coding assistant)
@@ -293,49 +322,118 @@ export function SettingsPage() {
     // Use real models if available, otherwise fallback to static list
     const builtInModels = {
       anthropic:
-        groupedModels.anthropic.length > 0 ? groupedModels.anthropic : fallbackModels.anthropic,
-      copilot: groupedModels.copilot.length > 0 ? groupedModels.copilot : fallbackModels.copilot,
-      google: groupedModels.google.length > 0 ? groupedModels.google : fallbackModels.google,
-      iflow: groupedModels.iflow.length > 0 ? groupedModels.iflow : fallbackModels.iflow,
-      kimi: groupedModels.kimi.length > 0 ? groupedModels.kimi : fallbackModels.kimi,
-      kiro: groupedModels.kiro.length > 0 ? groupedModels.kiro : fallbackModels.kiro,
-      openai: groupedModels.openai.length > 0 ? groupedModels.openai : fallbackModels.openai,
-      qwen: groupedModels.qwen.length > 0 ? groupedModels.qwen : fallbackModels.qwen,
+        groupedModels.anthropic.length > 0
+          ? groupedModels.anthropic
+          : fallbackModels.anthropic,
+      copilot:
+        groupedModels.copilot.length > 0
+          ? groupedModels.copilot
+          : fallbackModels.copilot,
+      google:
+        groupedModels.google.length > 0
+          ? groupedModels.google
+          : fallbackModels.google,
+      iflow:
+        groupedModels.iflow.length > 0
+          ? groupedModels.iflow
+          : fallbackModels.iflow,
+      kimi:
+        groupedModels.kimi.length > 0
+          ? groupedModels.kimi
+          : fallbackModels.kimi,
+      kiro:
+        groupedModels.kiro.length > 0
+          ? groupedModels.kiro
+          : fallbackModels.kiro,
+      openai:
+        groupedModels.openai.length > 0
+          ? groupedModels.openai
+          : fallbackModels.openai,
+      qwen:
+        groupedModels.qwen.length > 0
+          ? groupedModels.qwen
+          : fallbackModels.qwen,
     };
 
     return { builtInModels, customModels };
   };
 
-  const handleConfigChange = async (
+  // Debounced save function - gộp nhiều thay đổi thành 1 IPC call
+  const debouncedSave = (newConfig: ReturnType<typeof config>) => {
+    pendingConfig = newConfig;
+    if (saveTimer) clearTimeout(saveTimer);
+
+    saveTimer = window.setTimeout(async () => {
+      const configToSave = pendingConfig;
+      if (!configToSave) return;
+      pendingConfig = null;
+
+      setSaving(true);
+      try {
+        await saveConfig(configToSave);
+        // Chỉ show success nếu không có pending save mới
+        if (!pendingConfig) {
+          toastStore.success(t("settings.toasts.settingsSaved"));
+        }
+      } catch (error) {
+        console.error("Failed to save config:", error);
+        toastStore.error(
+          t("settings.toasts.settingsSaveFailed"),
+          String(error),
+        );
+      } finally {
+        if (!pendingConfig) {
+          setSaving(false);
+        }
+      }
+    }, 600); // 600ms debounce — gộp nhiều thay đổi
+  };
+
+  const handleConfigChange = (
     key: keyof ReturnType<typeof config>,
     value: boolean | number | string,
   ) => {
     const newConfig = { ...config(), [key]: value };
-    setConfig(newConfig);
+    setConfig(newConfig); // Cập nhật UI NGAY LẬP TỨC
 
-    // Auto-save config
-    setSaving(true);
-    try {
-      await saveConfig(newConfig);
-
-      // If management key changed and proxy is running, restart proxy to apply new key
-      if (key === "managementKey" && appStore.proxyStatus().running) {
-        toastStore.info(t("settings.toasts.restartingProxyForManagementKey"));
-        await stopProxy();
-        // Small delay to ensure config file is fully written and flushed
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        await startProxy();
-        toastStore.success(t("settings.toasts.proxyRestartedWithManagementKey"));
-      } else {
-        toastStore.success(t("settings.toasts.settingsSaved"));
-      }
-    } catch (error) {
-      console.error("Failed to save config:", error);
-      toastStore.error(t("settings.toasts.settingsSaveFailed"), String(error));
-    } finally {
-      setSaving(false);
+    // Xử lý đặc biệt cho management key (cần restart proxy)
+    if (key === "managementKey" && appStore.proxyStatus().running) {
+      // Trường hợp đặc biệt: cần await vì phải restart proxy
+      void (async () => {
+        setSaving(true);
+        try {
+          await saveConfig(newConfig);
+          toastStore.info(t("settings.toasts.restartingProxyForManagementKey"));
+          await stopProxy();
+          await new Promise((r) => setTimeout(r, 500));
+          await startProxy();
+          toastStore.success(
+            t("settings.toasts.proxyRestartedWithManagementKey"),
+          );
+        } catch (error) {
+          toastStore.error(
+            t("settings.toasts.settingsSaveFailed"),
+            String(error),
+          );
+        } finally {
+          setSaving(false);
+        }
+      })();
+      return;
     }
+
+    // Debounced save cho các trường hợp bình thường
+    debouncedSave(newConfig);
   };
+
+  // Cleanup: flush pending save khi component unmount
+  onCleanup(() => {
+    if (saveTimer) clearTimeout(saveTimer);
+    // Flush pending save nếu có
+    if (pendingConfig) {
+      void saveConfig(pendingConfig);
+    }
+  });
 
   return (
     <div class="flex min-h-screen flex-col">
@@ -348,7 +446,11 @@ export function SettingsPage() {
             </h1>
             {saving() && (
               <span class="ml-2 flex items-center gap-1 text-xs text-gray-400">
-                <svg class="h-3 w-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                <svg
+                  class="h-3 w-3 animate-spin"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                >
                   <circle
                     class="opacity-25"
                     cx="12"
@@ -418,7 +520,10 @@ export function SettingsPage() {
       <main class="flex-1 overflow-y-auto p-4 sm:p-6">
         <div class="animate-stagger mx-auto max-w-xl space-y-4 sm:space-y-6">
           {/* General settings */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400">
               {t("settings.general")}
             </h2>
@@ -428,7 +533,9 @@ export function SettingsPage() {
                 checked={config().launchAtLogin}
                 description={t("settings.launchAtLogin.description")}
                 label={t("settings.launchAtLogin.label")}
-                onChange={(checked) => handleConfigChange("launchAtLogin", checked)}
+                onChange={(checked) =>
+                  handleConfigChange("launchAtLogin", checked)
+                }
               />
 
               <div class="border-t border-gray-200 dark:border-gray-700" />
@@ -461,11 +568,15 @@ export function SettingsPage() {
                 </p>
                 <select
                   class="transition-smooth mt-2 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-                  onChange={(e) => handleConfigChange("locale", e.currentTarget.value)}
+                  onChange={(e) =>
+                    handleConfigChange("locale", e.currentTarget.value)
+                  }
                   value={config().locale || "en"}
                 >
                   <For each={LOCALE_OPTIONS}>
-                    {(locale) => <option value={locale}>{LOCALE_LABELS[locale]}</option>}
+                    {(locale) => (
+                      <option value={locale}>{LOCALE_LABELS[locale]}</option>
+                    )}
                   </For>
                 </select>
               </label>
@@ -473,7 +584,10 @@ export function SettingsPage() {
           </div>
 
           {/* Proxy settings */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <ProxySettings
               config={config}
               handleConfigChange={handleConfigChange}
@@ -485,7 +599,10 @@ export function SettingsPage() {
           </div>
 
           {/* Thinking Budget Settings */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <ThinkingReasoningSettings
               config={config}
               gptBaseModels={gptBaseModels}
@@ -498,7 +615,10 @@ export function SettingsPage() {
           </div>
 
           {/* Claude Code Settings */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <ClaudeCodeSettings
               config={config}
               getAvailableTargetModels={getAvailableTargetModels}
@@ -510,7 +630,10 @@ export function SettingsPage() {
           </div>
 
           {/* Amp CLI Integration */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <AmpSettings
               config={config}
               getAvailableTargetModels={getAvailableTargetModels}
@@ -524,7 +647,10 @@ export function SettingsPage() {
           </div>
 
           {/* Custom OpenAI-Compatible Providers */}
-          <div class="space-y-4" classList={{ hidden: activeTab() !== "general" }}>
+          <div
+            class="space-y-4"
+            classList={{ hidden: activeTab() !== "general" }}
+          >
             <OpenAIProviderSettings
               config={config}
               handleConfigChange={handleConfigChange}
@@ -581,7 +707,12 @@ export function SettingsPage() {
                     class="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
                     onClick={() => setConfigResult(null)}
                   >
-                    <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg
+                      class="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
                       <path
                         d="M6 18L18 6M6 6l12 12"
                         stroke-linecap="round"
@@ -596,7 +727,12 @@ export function SettingsPage() {
                   <Show when={result().result.configPath}>
                     <div class="rounded-lg border border-green-200 bg-green-50 p-3 dark:border-green-800 dark:bg-green-900/20">
                       <div class="flex items-center gap-2 text-green-700 dark:text-green-300">
-                        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg
+                          class="h-4 w-4"
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
                           <path
                             d="M5 13l4 4L19 7"
                             stroke-linecap="round"
@@ -604,7 +740,9 @@ export function SettingsPage() {
                             stroke-width="2"
                           />
                         </svg>
-                        <span class="text-sm font-medium">Config file created</span>
+                        <span class="text-sm font-medium">
+                          Config file created
+                        </span>
                       </div>
                       <p class="mt-1 break-all font-mono text-xs text-green-600 dark:text-green-400">
                         {result().result.configPath}
@@ -621,7 +759,9 @@ export function SettingsPage() {
                         <button
                           class="text-xs text-brand-500 hover:text-brand-600"
                           onClick={() => {
-                            navigator.clipboard.writeText(result().result.shellConfig!);
+                            navigator.clipboard.writeText(
+                              result().result.shellConfig!,
+                            );
                             toastStore.success(t("common.copied"));
                           }}
                         >
@@ -631,7 +771,12 @@ export function SettingsPage() {
                       <pre class="overflow-x-auto whitespace-pre-wrap rounded-lg bg-gray-100 p-3 font-mono text-xs text-gray-700 dark:bg-gray-800 dark:text-gray-300">
                         {result().result.shellConfig}
                       </pre>
-                      <Button class="w-full" onClick={handleApplyEnv} size="sm" variant="secondary">
+                      <Button
+                        class="w-full"
+                        onClick={handleApplyEnv}
+                        size="sm"
+                        variant="secondary"
+                      >
                         Add to Shell Profile Automatically
                       </Button>
                     </div>
@@ -647,7 +792,10 @@ export function SettingsPage() {
                 </div>
 
                 <div class="mt-6 flex justify-end">
-                  <Button onClick={() => setConfigResult(null)} variant="primary">
+                  <Button
+                    onClick={() => setConfigResult(null)}
+                    variant="primary"
+                  >
                     {t("agentSetup.configModal.done")}
                   </Button>
                 </div>

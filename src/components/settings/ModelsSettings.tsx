@@ -1,6 +1,10 @@
 import { createSignal, For, onMount, Show } from "solid-js";
 import { useI18n } from "../../i18n";
-import { configureCliAgent, detectCliAgents, getAvailableModels } from "../../lib/tauri";
+import {
+  configureCliAgent,
+  detectCliAgents,
+  getAvailableModels,
+} from "../../lib/tauri";
 import { appStore } from "../../stores/app";
 import { toastStore } from "../../stores/toast";
 import { ModelsWidget } from "../ModelsWidget";
@@ -19,7 +23,9 @@ export function ModelsSettings(props: ModelsSettingsProps) {
 
   const [models, setModels] = createSignal<AvailableModel[]>([]);
   const [agents, setAgents] = createSignal<AgentStatus[]>([]);
-  const [configuringAgent, setConfiguringAgent] = createSignal<string | null>(null);
+  const [configuringAgent, setConfiguringAgent] = createSignal<string | null>(
+    null,
+  );
 
   onMount(async () => {
     // Load models if proxy is running
@@ -78,7 +84,10 @@ export function ModelsSettings(props: ModelsSettingsProps) {
         <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-600 dark:text-gray-400">
           Available Models
         </h2>
-        <ModelsWidget loading={!appStore.proxyStatus().running} models={models()} />
+        <ModelsWidget
+          loading={!appStore.proxyStatus().running}
+          models={models()}
+        />
       </div>
 
       {/* CLI Agents */}
@@ -92,7 +101,11 @@ export function ModelsSettings(props: ModelsSettingsProps) {
               <div class="flex items-center justify-between p-3">
                 <div class="flex items-center gap-3">
                   <Show when={agent.logo}>
-                    <img alt={agent.name} class="h-6 w-6 rounded" src={agent.logo} />
+                    <img
+                      alt={agent.name}
+                      class="h-6 w-6 rounded"
+                      src={agent.logo}
+                    />
                   </Show>
                   <div>
                     <div class="flex items-center gap-2">
@@ -105,7 +118,9 @@ export function ModelsSettings(props: ModelsSettingsProps) {
                         </span>
                       </Show>
                     </div>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">{agent.description}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">
+                      {agent.description}
+                    </p>
                   </div>
                 </div>
                 <Button
@@ -116,7 +131,11 @@ export function ModelsSettings(props: ModelsSettingsProps) {
                 >
                   <Show
                     fallback={
-                      <svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <svg
+                        class="h-4 w-4 animate-spin"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                      >
                         <circle
                           class="opacity-25"
                           cx="12"

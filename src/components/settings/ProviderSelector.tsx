@@ -1,4 +1,12 @@
-import { createEffect, createSignal, For, Show, untrack } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  on,
+  onMount,
+  Show,
+  untrack,
+} from "solid-js";
 import { useI18n } from "../../i18n";
 import {
   getAvailableRotationProviders,
@@ -99,6 +107,10 @@ export function ProviderSelector(props: ProviderSelectorProps) {
   // Provider list
   const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
   const [selectedProviderId, setSelectedProviderId] = createSignal<string>("");
+  const [hasLoadedProviders, setHasLoadedProviders] = createSignal(false);
+  const [hasLoadedMetadata, setHasLoadedMetadata] = createSignal<
+    Record<string, boolean>
+  >({});
 
   // Metadata for selected provider
   const [metadata, setMetadata] = createSignal<ProviderMetadata | null>(null);
@@ -127,10 +139,14 @@ export function ProviderSelector(props: ProviderSelectorProps) {
   const loadMetadata = async (providerId: string) => {
     if (!providerId) return;
 
+    // Skip if already loaded for this provider
+    if (hasLoadedMetadata()[providerId]) return;
+
     setLoadingMetadata(true);
     try {
       const meta = await getProviderMetadata(providerId);
       setMetadata(meta);
+      setHasLoadedMetadata((prev) => ({ ...prev, [providerId]: true }));
     } catch (error) {
       console.error("Failed to load provider metadata:", error);
       toastStore.error("Failed to load provider metadata", String(error));
@@ -140,48 +156,66 @@ export function ProviderSelector(props: ProviderSelectorProps) {
     }
   };
 
-  // Initial load
-  createEffect(() => {
-    loadProviders();
+  // Initial load - only once on mount
+  onMount(() => {
+    if (!hasLoadedProviders()) {
+      setHasLoadedProviders(true);
+      void loadProviders();
+    }
   });
 
   // Sync FROM URL -> Form (when URL changes externally)
-  createEffect(() => {
-    const url = props.rotationUrl;
-    const parsed = parseRotationUrl(url);
+  // Use 'on' with defer to only run when rotationUrl actually changes
+  createEffect(
+    on(
+      () => props.rotationUrl,
+      (url) => {
+        const parsed = parseRotationUrl(url);
 
-    if (parsed) {
-      setIsSyncingFromUrl(true);
+        if (parsed) {
+          setIsSyncingFromUrl(true);
 
-      // Update provider selection
-      if (parsed.providerId && parsed.providerId !== selectedProviderId()) {
-        setSelectedProviderId(parsed.providerId);
-        void loadMetadata(parsed.providerId);
-      }
+          // Update provider selection
+          if (
+            parsed.providerId &&
+            parsed.providerId !== untrack(selectedProviderId)
+          ) {
+            setSelectedProviderId(parsed.providerId);
+            void loadMetadata(parsed.providerId);
+          }
 
-      // Update form fields
-      setApiKey(parsed.apiKey);
-      setNetworkType(parsed.networkType || "random");
-      setLocationFilter(parsed.locationFilter || "0");
+          // Update form fields
+          setApiKey(parsed.apiKey);
+          setNetworkType(parsed.networkType || "random");
+          setLocationFilter(parsed.locationFilter || "0");
 
-      // Notify parent of parsed settings
-      props.onSettingsChange?.(parsed);
+          // Notify parent of parsed settings
+          props.onSettingsChange?.(parsed);
 
-      // Reset syncing flag after a tick
-      setTimeout(() => setIsSyncingFromUrl(false), 0);
-    } else {
-      // URL is not a valid rotation URL
-      props.onSettingsChange?.(undefined);
-    }
-  });
+          // Reset syncing flag after a tick
+          setTimeout(() => setIsSyncingFromUrl(false), 0);
+        } else {
+          // URL is not a valid rotation URL
+          props.onSettingsChange?.(undefined);
+        }
+      },
+      { defer: true },
+    ),
+  );
 
   // Load metadata when provider selection changes (only if not syncing from URL)
-  createEffect(() => {
-    const providerId = selectedProviderId();
-    if (providerId && !isSyncingFromUrl()) {
-      void loadMetadata(providerId);
-    }
-  });
+  // Use 'on' to explicitly track only selectedProviderId
+  createEffect(
+    on(
+      selectedProviderId,
+      (providerId) => {
+        if (providerId && !untrack(isSyncingFromUrl)) {
+          void loadMetadata(providerId);
+        }
+      },
+      { defer: true },
+    ),
+  );
 
   // Sync FROM Form -> URL (when form fields change)
   const syncToUrl = () => {
@@ -258,7 +292,8 @@ export function ProviderSelector(props: ProviderSelectorProps) {
       </div>
 
       <p class="text-xs text-gray-500 dark:text-gray-400">
-        Configure your rotation proxy settings below. The URL above will be automatically updated.
+        Configure your rotation proxy settings below. The URL above will be
+        automatically updated.
       </p>
 
       {/* Provider Select */}
@@ -273,9 +308,7 @@ export function ProviderSelector(props: ProviderSelectorProps) {
           value={selectedProviderId()}
         >
           <For each={providers()}>
-            {(provider) => (
-              <option value={provider.id}>{provider.name}</option>
-            )}
+            {(provider) => <option value={provider.id}>{provider.name}</option>}
           </For>
         </select>
         <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
@@ -341,7 +374,9 @@ export function ProviderSelector(props: ProviderSelectorProps) {
               </span>
               <select
                 class="transition-smooth mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-transparent focus:ring-2 focus:ring-brand-500 dark:border-gray-600 dark:bg-gray-900"
-                onChange={(e) => handleLocationFilterChange(e.currentTarget.value)}
+                onChange={(e) =>
+                  handleLocationFilterChange(e.currentTarget.value)
+                }
                 value={locationFilter()}
               >
                 <For each={metadata()?.locationOptions ?? []}>
@@ -361,7 +396,9 @@ export function ProviderSelector(props: ProviderSelectorProps) {
       {/* Info note - no separate save button needed */}
       <div class="rounded-lg bg-blue-50 px-3 py-2 dark:bg-blue-900/20">
         <p class="text-xs text-blue-600 dark:text-blue-400">
-          <span class="font-medium">💡 Tip:</span> Changes are automatically synced to the URL above. Use the main "Save Settings" button to save all proxy configuration.
+          <span class="font-medium">💡 Tip:</span> Changes are automatically
+          synced to the URL above. Use the main "Save Settings" button to save
+          all proxy configuration.
         </p>
       </div>
     </div>

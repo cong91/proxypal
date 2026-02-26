@@ -30,7 +30,7 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), String> {
+pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
     // Decode proxy_url if it's URL-encoded (to fix Tauri IPC truncation issue)
     // The frontend encodes proxyUrl using encodeURIComponent() before sending via Tauri IPC
     if let Ok(decoded) = urlencoding::decode(&config.proxy_url) {
@@ -54,10 +54,19 @@ pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), 
         }
     }
 
-    persist_config(&config)?;
+    // Cập nhật in-memory state TRƯỚC (nhanh, non-blocking)
+    {
+        let mut current_config = state.config.lock().unwrap();
+        *current_config = config.clone();
+    }
 
-    let mut current_config = state.config.lock().unwrap();
-    *current_config = config.clone();
+    // Đẩy file I/O xuống blocking thread pool
+    let config_for_io = config.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_config(&config_for_io)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
 
     eprintln!("[ProxyPal Debug] Config saved successfully");
     Ok(())

@@ -188,7 +188,7 @@ impl ProxyVNProvider {
         };
 
         let now = Instant::now();
-        let cached = CachedProxy {
+        let mut cached = CachedProxy {
             http_proxy: proxy_response.proxy_http.clone(),
             socks5_proxy: proxy_response.proxy_socks5.clone(),
             real_ip: proxy_response.ip.clone(),
@@ -196,6 +196,14 @@ impl ProxyVNProvider {
             ttl_seconds: effective_ttl,
             created_at: now,
         };
+
+        // Nếu provider không trả về IP, thử lấy qua external API
+        if cached.real_ip.is_empty() {
+            debug!("[ProxyVN] Provider didn't return IP, attempting to fetch via external API");
+            if let Err(e) = self.base.fetch_real_ip_if_missing(&mut cached).await {
+                warn!("[ProxyVN] Failed to fetch real IP: {}", e);
+            }
+        }
 
         info!(
             "[ProxyVN] Fetched new proxy - HTTP: {}, SOCKS5: {}, Real IP: {}, TTL: {}s (effective: {}s)",
