@@ -9,8 +9,8 @@ pub mod ssh_manager;
 pub mod cloudflare_manager;
 
 // Re-export for testing binaries
-pub use proxy::RotationProxyProvider;
-pub use types::proxy::CachedProxy;
+pub use proxy::{RotationProxyProvider, ProxyProviderFactory, DynProxyProvider, ProxyProvider};
+pub use types::proxy::{CachedProxy, RotationProxySettings, ProviderMetadata, ProviderInfo};
 
 use crate::config::{get_auth_path, load_config};
 use crate::helpers::migration::migrate_to_split_storage;
@@ -356,6 +356,9 @@ pub fn run() {
             commands::proxy::stop_proxy,
             commands::proxy::get_rotation_status,
             commands::proxy::force_rotate_proxy,
+            commands::proxy::get_available_rotation_providers,
+            commands::proxy::get_provider_metadata,
+            commands::proxy::update_rotation_settings,
             // Copilot Management
             commands::copilot::get_copilot_status,
             commands::copilot::start_copilot,

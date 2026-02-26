@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::types::{
     amp::generate_uuid, cloudflare::CloudflareConfig, AmpModelMapping, AmpOpenAIProvider,
-    ClaudeApiKey, CodexApiKey, CopilotConfig, GeminiApiKey, SshConfig, VertexApiKey,
+    ClaudeApiKey, CodexApiKey, CopilotConfig, GeminiApiKey, RotationProxySettings, SshConfig, VertexApiKey,
 };
 
 /// App configuration persisted to config.json
@@ -93,6 +93,16 @@ pub struct AppConfig {
     pub cloudflare_configs: Vec<CloudflareConfig>,
     #[serde(default = "default_disable_control_panel")]
     pub disable_control_panel: bool,
+    /// New: structured rotation settings
+    #[serde(default)]
+    pub rotation_settings: Option<RotationProxySettings>,
+    /// Selected provider ID (for UI state)
+    #[serde(default = "default_rotation_provider_id")]
+    pub rotation_provider_id: String,
+}
+
+fn default_rotation_provider_id() -> String {
+    "proxy_vn".to_string()
 }
 
 fn default_disable_control_panel() -> bool {
@@ -181,6 +191,8 @@ impl Default for AppConfig {
             ssh_configs: Vec::new(),
             cloudflare_configs: Vec::new(),
             disable_control_panel: true,
+            rotation_settings: None,
+            rotation_provider_id: "proxy_vn".to_string(),
         }
     }
 }

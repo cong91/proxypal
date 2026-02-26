@@ -10,9 +10,11 @@ import {
   stopProxy,
 } from "../../lib/tauri";
 import { toastStore } from "../../stores/toast";
+import { ProviderSelector } from "./ProviderSelector";
 import { RotationStatus } from "./RotationStatus";
 
 import type { SettingsBaseProps } from "./types";
+import type { RotationProxySettings } from "../../lib/tauri/proxy";
 
 interface ProxySettingsProps extends SettingsBaseProps {
   proxyRunning: boolean;
@@ -193,7 +195,27 @@ export function ProxySettings(props: ProxySettingsProps) {
           </label>
         </Show>
 
-        {/* Rotation Status Widget - shown when using rotation:// URL */}
+        {/* Provider Selector - shown when using rotation:// URL */}
+        <Show when={isRotationProxyUrl(effectiveProxyUrl())}>
+          <ProviderSelector
+            rotationUrl={effectiveProxyUrl()}
+            onUrlChange={(url) => {
+              local.handleConfigChange("proxyUrl", url);
+            }}
+            onSettingsChange={(settings: RotationProxySettings | undefined) => {
+              if (settings) {
+                const currentConfig = local.config();
+                local.setConfig({
+                  ...currentConfig,
+                  rotationSettings: settings,
+                  rotationProviderId: settings.providerId,
+                });
+              }
+            }}
+          />
+        </Show>
+
+        {/* Rotation Status Widget - shown when using rotation:// URL and proxy is running */}
         <Show when={showRotationStatus()}>
           <RotationStatus isActive={showRotationStatus()} />
         </Show>

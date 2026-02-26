@@ -6,7 +6,7 @@
 //! the Tauri UI or the full application to be running.
 
 use std::time::Duration;
-use proxypal_lib::{RotationProxyProvider, CachedProxy};
+use proxypal_lib::{RotationProxyProvider, CachedProxy, ProxyProvider};
 
 #[tokio::main]
 async fn main() {

@@ -10,11 +10,45 @@ export interface ProxyStatus {
 
 export interface RotationStatus {
   active: boolean;
+  providerId?: string;
+  providerName?: string;
   currentProxy: string;
   /** Real external IP address (dynamic, changes on rotation) */
   realIp: string;
   expiresInSeconds: number;
   ttlSeconds: number;
+}
+
+// Provider types for multi-provider proxy rotation
+export interface ProviderInfo {
+  id: string;
+  name: string;
+}
+
+export interface NetworkOption {
+  value: string;
+  label: string;
+}
+
+export interface LocationOption {
+  value: string;
+  label: string;
+}
+
+export interface ProviderMetadata {
+  id: string;
+  name: string;
+  requiredFields: string[];
+  networkOptions: NetworkOption[];
+  locationOptions: LocationOption[];
+}
+
+export interface RotationProxySettings {
+  providerId: string;
+  apiKey: string;
+  networkType: string;
+  locationFilter: string;
+  customApiUrl?: string;
 }
 
 export async function startProxy(): Promise<ProxyStatus> {
@@ -84,4 +118,17 @@ export async function onRotationProxyActive(
   return listen<{ active: boolean }>("rotation-proxy-active", (event) => {
     callback(event.payload);
   });
+}
+
+// Multi-provider proxy rotation API
+export async function getAvailableRotationProviders(): Promise<ProviderInfo[]> {
+  return invoke("get_available_rotation_providers");
+}
+
+export async function getProviderMetadata(providerId: string): Promise<ProviderMetadata> {
+  return invoke("get_provider_metadata", { providerId });
+}
+
+export async function updateRotationSettings(settings: RotationProxySettings): Promise<void> {
+  return invoke("update_rotation_settings", { settings });
 }

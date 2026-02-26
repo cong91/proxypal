@@ -30,7 +30,13 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn save_config(state: State<AppState>, config: AppConfig) -> Result<(), String> {
+pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), String> {
+    // Decode proxy_url if it's URL-encoded (to fix Tauri IPC truncation issue)
+    // The frontend encodes proxyUrl using encodeURIComponent() before sending via Tauri IPC
+    if let Ok(decoded) = urlencoding::decode(&config.proxy_url) {
+        config.proxy_url = decoded.into_owned();
+    }
+    
     // Debug: Log provider models before save
     eprintln!(
         "[ProxyPal Debug] Saving {} custom providers",

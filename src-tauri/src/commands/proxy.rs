@@ -7,12 +7,13 @@ use tauri_plugin_shell::ShellExt;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::types::{ProxyStatus, RotationStatus};
+use crate::types::{ProxyStatus, RotationStatus, RotationProxySettings, ProviderMetadata};
+use crate::types::proxy::{ProviderInfo, NetworkOption, LocationOption};
 use crate::helpers::log_watcher::start_log_watcher;
 use crate::get_management_key;
 use crate::GPT5_BASE_MODELS;
 use crate::GPT5_REASONING_SUFFIXES;
-use crate::proxy::RotationProxyProvider;
+use crate::proxy::{RotationProxyProvider, ProxyProviderFactory, ProxyProvider};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -940,9 +941,21 @@ pub async fn start_proxy(
         tokio::spawn(async move {
             println!("[RotationProxy] Starting TTL monitor task (sleep interval: 30s)");
             
+            // Track consecutive failures and backoff to prevent infinite loops
+            let mut consecutive_failures: u32 = 0;
+            let max_backoff_interval_secs: u64 = 300; // Max 5 minutes between retries
+            
             while ttl_monitor_running.load(Ordering::SeqCst) {
-                // Check every 30 seconds - CPU efficient, no busy-waiting
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                // Calculate sleep interval with exponential backoff on failure
+                let sleep_secs = if consecutive_failures > 0 {
+                    // Exponential backoff: 30s * 2^failures, capped at 5 minutes
+                    let backoff = 30u64.saturating_mul(2u64.saturating_pow(consecutive_failures));
+                    backoff.min(max_backoff_interval_secs)
+                } else {
+                    30 // Normal 30s interval
+                };
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                 
                 // Double-check cancellation after sleep (avoid race condition)
                 if !ttl_monitor_running.load(Ordering::SeqCst) {
@@ -954,13 +967,26 @@ pub async fn start_proxy(
                     .as_ref()
                     .map(|cached| cached.expires_in_seconds())
                     .unwrap_or(0);
-                println!(
-                    "[RotationProxy][TTL] Tick: remaining={}s threshold=60s",
-                    current_remaining
-                );
+                
+                // Only check for rotation if we have a valid cached proxy or have had failures
+                let should_check_rotation = current_cached.is_some() || consecutive_failures > 0;
+                
+                if should_check_rotation {
+                    println!(
+                        "[RotationProxy][TTL] Tick: remaining={}s threshold=60s failures={}",
+                        current_remaining, consecutive_failures
+                    );
+                }
 
-                // Check if proxy is about to expire (within 60 seconds)
-                if provider.is_about_to_expire(60).await {
+                // Check if proxy is about to expire (within 60 seconds) or we need to retry after failure
+                let needs_rotation = if consecutive_failures > 0 {
+                    // After a failure, wait at least 60s before retrying (provider cooldown)
+                    false // Handled by backoff interval above
+                } else {
+                    provider.is_about_to_expire(60).await
+                };
+                
+                if needs_rotation {
                     println!(
                         "[RotationProxy] Proxy about to expire, rotating... remaining={}s",
                         current_remaining
@@ -973,6 +999,9 @@ pub async fn start_proxy(
 
                     match provider.force_rotate().await {
                         Ok(cached) => {
+                            // Reset failure counter on success
+                            consecutive_failures = 0;
+                            
                             if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
                                 println!(
                                     "[RotationProxy][TTL] Rotation candidate: old='{}' new='{}' changed={} expires_in={}s ttl={}s",
@@ -1015,6 +1044,15 @@ pub async fn start_proxy(
                         }
                         Err(e) => {
                             println!("[RotationProxy] Failed to fetch new proxy: {}", e);
+                            
+                            // Increment failure counter for backoff
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            println!(
+                                "[RotationProxy] Backoff enabled: failures={} next_retry={}s",
+                                consecutive_failures,
+                                30u64.saturating_mul(2u64.saturating_pow(consecutive_failures)).min(max_backoff_interval_secs)
+                            );
+                            
                             let _ = app_handle.emit("rotation-proxy-error", serde_json::json!({
                                 "error": e,
                             }));
@@ -1129,6 +1167,8 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
             if let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) {
                 return Ok(RotationStatus {
                     active: true,
+                    provider_id: Some("proxy_vn".to_string()),
+                    provider_name: Some("Proxy.vn / ProxyXoay".to_string()),
                     current_proxy: proxy_url,
                     real_ip: cached.real_ip.clone(),
                     expires_in_seconds: cached.expires_in_seconds(),
@@ -1140,6 +1180,8 @@ pub async fn get_rotation_status(state: State<'_, AppState>) -> Result<RotationS
         // Provider exists but no cached proxy yet
         return Ok(RotationStatus {
             active: true,
+            provider_id: Some("proxy_vn".to_string()),
+            provider_name: Some("Proxy.vn / ProxyXoay".to_string()),
             current_proxy: String::new(),
             real_ip: String::new(),
             expires_in_seconds: 0,
@@ -1223,6 +1265,8 @@ pub async fn force_rotate_proxy(
                             
                             return Ok(RotationStatus {
                                 active: true,
+                                provider_id: Some("proxy_vn".to_string()),
+                                provider_name: Some("Proxy.vn / ProxyXoay".to_string()),
                                 current_proxy: proxy_url,
                                 real_ip: cached.real_ip.clone(),
                                 expires_in_seconds: cached.expires_in_seconds(),
@@ -1257,6 +1301,82 @@ pub async fn force_rotate_proxy(
     
     warn!("[RotationProxy][Manual] No rotation provider active");
     Err("No rotation proxy is active. Please start the proxy first by clicking the 'Start Proxy' button.".to_string())
+}
+
+/// Lấy danh sách available providers
+#[tauri::command]
+pub async fn get_available_rotation_providers() -> Vec<ProviderInfo> {
+    // Run the sync operation in a blocking task to avoid blocking the async runtime
+    tokio::task::spawn_blocking(|| {
+        ProxyProviderFactory::available_providers()
+    }).await.unwrap_or_default()
+}
+
+/// Lấy metadata cho một provider
+#[tauri::command]
+pub async fn get_provider_metadata(provider_id: String) -> Result<ProviderMetadata, String> {
+    // Return provider-specific metadata (fields, options, etc.)
+    match provider_id.as_str() {
+        "proxy_vn" => Ok(ProviderMetadata {
+            id: "proxy_vn".to_string(),
+            name: "Proxy.vn / ProxyXoay".to_string(),
+            required_fields: vec!["apiKey".to_string()],
+            network_options: vec![
+                NetworkOption { value: "random".to_string(), label: "Random".to_string() },
+                NetworkOption { value: "viettel".to_string(), label: "Viettel".to_string() },
+                NetworkOption { value: "vinaphone".to_string(), label: "Vinaphone".to_string() },
+                NetworkOption { value: "mobifone".to_string(), label: "Mobifone".to_string() },
+            ],
+            location_options: vec![
+                LocationOption { value: "0".to_string(), label: "All".to_string() },
+                LocationOption { value: "1".to_string(), label: "Hanoi".to_string() },
+                LocationOption { value: "2".to_string(), label: "Ho Chi Minh City".to_string() },
+            ],
+        }),
+        _ => Err(format!("Unknown provider: {}", provider_id)),
+    }
+}
+
+/// Cập nhật rotation settings và khởi tạo provider mới
+#[tauri::command]
+pub async fn update_rotation_settings(
+    state: State<'_, AppState>,
+    settings: RotationProxySettings,
+) -> Result<(), String> {
+    // 1. Save settings to config
+    {
+        let mut config = state.config.lock().unwrap();
+        config.rotation_settings = Some(settings.clone());
+        config.rotation_provider_id = settings.provider_id.clone();
+        // Build rotation URL from settings
+        config.proxy_url = build_rotation_url(&settings)?;
+    }
+
+    // 2. Create new provider
+    let rotation_url = build_rotation_url(&settings)?;
+    let provider = ProxyProviderFactory::create_by_id(&settings.provider_id, &rotation_url)?;
+
+    // 3. Update state
+    {
+        let mut rotation_provider = state.rotation_provider.lock().unwrap();
+        *rotation_provider = Some(provider);
+    }
+
+    Ok(())
+}
+
+fn build_rotation_url(settings: &RotationProxySettings) -> Result<String, String> {
+    // Build rotation:// URL từ settings
+    // Format: rotation://proxyxoay.shop?key=XXX&nhamang=YYY&tinhthanh=ZZZ
+    let host = match settings.provider_id.as_str() {
+        "proxy_vn" => "proxyxoay.shop",
+        _ => return Err(format!("Unknown provider: {}", settings.provider_id)),
+    };
+
+    Ok(format!(
+        "rotation://{}?key={}&nhamang={}&tinhthanh={}",
+        host, settings.api_key, settings.network_type, settings.location_filter
+    ))
 }
 
 #[cfg(test)]

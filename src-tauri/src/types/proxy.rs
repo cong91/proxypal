@@ -78,13 +78,68 @@ pub struct RotationConfig {
     pub tinhthanh: String,
 }
 
+/// Configuration cho rotation proxy settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationProxySettings {
+    /// Provider được chọn (vd: "proxy_vn", "proxy_xoay")
+    pub provider_id: String,
+    /// API key cho provider
+    pub api_key: String,
+    /// Network type (provider-specific)
+    pub network_type: String,
+    /// Province/city filter (provider-specific)
+    pub location_filter: String,
+    /// Custom API URL (optional, cho self-hosted hoặc custom endpoints)
+    pub custom_api_url: Option<String>,
+}
+
+impl Default for RotationProxySettings {
+    fn default() -> Self {
+        Self {
+            provider_id: "proxy_vn".to_string(),
+            api_key: String::new(),
+            network_type: "random".to_string(),
+            location_filter: "0".to_string(),
+            custom_api_url: None,
+        }
+    }
+}
+
+/// Provider metadata cho frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderMetadata {
+    pub id: String,
+    pub name: String,
+    /// Các fields cần thiết cho provider này
+    pub required_fields: Vec<String>,
+    /// Các options cho network type (nếu có)
+    pub network_options: Vec<NetworkOption>,
+    /// Các options cho location filter (nếu có)
+    pub location_options: Vec<LocationOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationOption {
+    pub value: String,
+    pub label: String,
+}
+
 /// Status information for rotation proxy (returned to frontend)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotationStatus {
     pub active: bool,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
     pub current_proxy: String,
-    /// Real external IP address (the dynamic IP that changes on rotation)
     pub real_ip: String,
     pub expires_in_seconds: u64,
     pub ttl_seconds: u64,
@@ -94,10 +149,19 @@ impl Default for RotationStatus {
     fn default() -> Self {
         Self {
             active: false,
+            provider_id: None,
+            provider_name: None,
             current_proxy: String::new(),
             real_ip: String::new(),
             expires_in_seconds: 0,
             ttl_seconds: 0,
         }
     }
+}
+
+/// Thông tin provider cho UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderInfo {
+    pub id: String,
+    pub name: String,
 }

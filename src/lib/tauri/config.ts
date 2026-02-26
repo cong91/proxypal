@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CloudflareConfig } from "./cloudflare";
 import type { AmpModelMapping, AmpOpenAIProvider, CopilotConfig } from "./models";
 import type { SshConfig } from "./ssh";
+import type { RotationProxySettings } from "./proxy";
 
 // Config
 export interface AppConfig {
@@ -33,6 +34,8 @@ export interface AppConfig {
   quotaSwitchProject: boolean;
   requestLogging: boolean;
   requestRetry: number;
+  rotationProviderId?: string; // Selected rotation proxy provider ID
+  rotationSettings?: RotationProxySettings | null; // Rotation proxy settings
   routingStrategy: string; // "round-robin", "fill-first", "sequential"
   sidebarPinned?: boolean;
   sshConfigs?: SshConfig[];
@@ -46,7 +49,12 @@ export async function getConfig(): Promise<AppConfig> {
 }
 
 export async function saveConfig(config: AppConfig): Promise<void> {
-  return invoke("save_config", { config });
+  // Encode proxyUrl to prevent Tauri IPC from truncating query parameters
+  const configToSend = {
+    ...config,
+    proxyUrl: encodeURIComponent(config.proxyUrl),
+  };
+  return invoke("save_config", { config: configToSend });
 }
 
 export async function reloadConfig(): Promise<AppConfig> {
