@@ -48,4 +48,7 @@ uuid = { version = "1", features = ["v4"] }
 tauri-plugin-fs = "2.4.4"
 sysproxy = "0.3.0"
 env_proxy = "0.4.1"
+log = "0.4"
+async-trait = "0.1"
+urlencoding = "2"
 

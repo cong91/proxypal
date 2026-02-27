@@ -1,3 +1,4 @@
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,10 @@ use sysproxy::Sysproxy;
 use url::Url;
 
 const DEFAULT_PROXY_CHECK_URL: &str = "https://example.com";
+const MIN_ROTATION_REQUEST_RETRY: u16 = 1;
+const ROTATION_ERROR_COOLDOWN_SECS: u64 = 8;
+const ROTATION_ERROR_MAX_ATTEMPTS: u32 = 3;
+const ROTATION_ERROR_BASE_DELAY_MS: u64 = 600;
 
 /// Check if a URL is a rotation proxy URL
 fn is_rotation_url(url: &str) -> bool {
@@ -138,6 +143,286 @@ fn env_proxy_for_url(target_url: &str) -> Option<String> {
     let proxy = env_proxy::for_url(&parsed);
     let (host, port) = proxy.host_port()?;
     Some(format!("http://{}:{}", host, port))
+}
+
+fn is_trackable_proxy_request_line(line: &str) -> bool {
+    line.contains("/chat/completions")
+        || line.contains("/v1/messages")
+        || line.contains("/completions")
+        || line.contains("/v1beta")
+        || line.contains(":generateContent")
+        || line.contains(":streamGenerateContent")
+}
+
+fn is_retryable_proxy_error_line(line: &str) -> bool {
+    if !is_trackable_proxy_request_line(line) {
+        return false;
+    }
+
+    let has_retryable_status = [
+        "| 407 |", "| 408 |", "| 429 |", "| 500 |", "| 502 |", "| 503 |", "| 504 |",
+    ]
+    .iter()
+    .any(|token| line.contains(token));
+
+    if has_retryable_status {
+        return true;
+    }
+
+    let lower = line.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "deadline exceeded",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+        "no route to host",
+        "proxyconnect tcp",
+        "proxy connect",
+        "proxy authentication required",
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "upstream connect error",
+        "tls handshake",
+        "eof",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+fn truncate_log_line(line: &str) -> String {
+    const MAX_CHARS: usize = 220;
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+
+    let mut shortened: String = trimmed.chars().take(MAX_CHARS).collect();
+    shortened.push('…');
+    shortened
+}
+
+async fn update_rotation_proxy_url_via_management(port: u16, proxy_url: &str) -> Result<(), String> {
+    let update_url = format!("http://127.0.0.1:{}/v0/management/proxy-url", port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .put(&update_url)
+        .header("X-Management-Key", &get_management_key())
+        .json(&serde_json::json!({"value": proxy_url}))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to update proxy via Management API: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Management API returned error status: {}",
+            response.status()
+        ))
+    }
+}
+
+async fn rotate_proxy_on_request_failure(
+    app: &tauri::AppHandle,
+    provider: Arc<RotationProxyProvider>,
+    port: u16,
+    trigger_line: &str,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+
+    for attempt in 0..ROTATION_ERROR_MAX_ATTEMPTS {
+        match provider.force_rotate().await {
+            Ok(cached) => {
+                let Some(proxy_url) = RotationProxyProvider::resolve_proxy_url(&cached) else {
+                    last_error = "failed to resolve rotated proxy URL".to_string();
+                    warn!(
+                        "[RotationProxy][Retry] Attempt {}/{} failed: {}",
+                        attempt + 1,
+                        ROTATION_ERROR_MAX_ATTEMPTS,
+                        last_error
+                    );
+                    if attempt + 1 < ROTATION_ERROR_MAX_ATTEMPTS {
+                        let backoff_ms = ROTATION_ERROR_BASE_DELAY_MS
+                            .saturating_mul(2u64.saturating_pow(attempt));
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                    continue;
+                };
+
+                match update_rotation_proxy_url_via_management(port, &proxy_url).await {
+                    Ok(()) => {
+                        info!(
+                            "[RotationProxy][Retry] Rotated after request failure on attempt {}/{}",
+                            attempt + 1,
+                            ROTATION_ERROR_MAX_ATTEMPTS
+                        );
+                        let _ = app.emit("rotation-proxy-updated", serde_json::json!({
+                            "proxy": proxy_url,
+                            "realIp": cached.real_ip,
+                            "ttl": cached.ttl_seconds,
+                            "expiresInSeconds": cached.expires_in_seconds(),
+                            "reason": "request-failure-auto-rotate",
+                            "trigger": trigger_line,
+                            "attempt": attempt + 1,
+                        }));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        last_error = e;
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = e;
+            }
+        }
+
+        warn!(
+            "[RotationProxy][Retry] Attempt {}/{} failed: {}",
+            attempt + 1,
+            ROTATION_ERROR_MAX_ATTEMPTS,
+            last_error
+        );
+
+        if attempt + 1 < ROTATION_ERROR_MAX_ATTEMPTS {
+            let backoff_ms = ROTATION_ERROR_BASE_DELAY_MS.saturating_mul(2u64.saturating_pow(attempt));
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    let final_error = format!(
+        "auto-rotate failed after {} attempts: {}",
+        ROTATION_ERROR_MAX_ATTEMPTS,
+        last_error
+    );
+    let _ = app.emit("rotation-proxy-error", serde_json::json!({
+        "error": final_error,
+        "reason": "request-failure-auto-rotate",
+        "trigger": trigger_line,
+    }));
+    Err(final_error)
+}
+
+fn start_rotation_error_monitor(
+    app: tauri::AppHandle,
+    provider: Arc<RotationProxyProvider>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    port: u16,
+    log_path: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        let mut attempts = 0;
+        while running.load(Ordering::SeqCst) && !log_path.exists() && attempts < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            attempts += 1;
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if !log_path.exists() {
+            warn!("[RotationProxy][Retry] Log file not found: {:?}", log_path);
+            return;
+        }
+
+        let file = match std::fs::File::open(&log_path) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("[RotationProxy][Retry] Failed to open log file: {}", e);
+                return;
+            }
+        };
+
+        let mut reader = BufReader::new(file);
+        if let Err(e) = reader.seek(SeekFrom::End(0)) {
+            warn!("[RotationProxy][Retry] Failed to seek log file: {}", e);
+            return;
+        }
+
+        let mut last_pos = reader.stream_position().unwrap_or(0);
+        let rotation_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut last_rotation_at: Option<Instant> = None;
+
+        info!("[RotationProxy][Retry] Request failure monitor started");
+
+        while running.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            let current_size = std::fs::metadata(&log_path)
+                .map(|m| m.len())
+                .unwrap_or(last_pos);
+
+            if current_size <= last_pos {
+                if current_size < last_pos {
+                    last_pos = 0;
+                    match std::fs::File::open(&log_path) {
+                        Ok(new_file) => {
+                            reader = BufReader::new(new_file);
+                        }
+                        Err(e) => {
+                            warn!("[RotationProxy][Retry] Failed to reopen log file: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if is_retryable_proxy_error_line(&line) {
+                    let in_cooldown = last_rotation_at
+                        .map(|at| at.elapsed() < Duration::from_secs(ROTATION_ERROR_COOLDOWN_SECS))
+                        .unwrap_or(false);
+
+                    if !in_cooldown {
+                        last_rotation_at = Some(Instant::now());
+                        let trigger = truncate_log_line(&line);
+                        let app_clone = app.clone();
+                        let provider_clone = provider.clone();
+                        let in_progress_flag = rotation_in_progress.clone();
+
+                        tauri::async_runtime::spawn(async move {
+                            if in_progress_flag
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_err()
+                            {
+                                return;
+                            }
+
+                            let rotate_result = rotate_proxy_on_request_failure(
+                                &app_clone,
+                                provider_clone,
+                                port,
+                                &trigger,
+                            )
+                            .await;
+
+                            if let Err(e) = rotate_result {
+                                warn!("[RotationProxy][Retry] {}", e);
+                            }
+
+                            in_progress_flag.store(false, Ordering::SeqCst);
+                        });
+                    }
+                }
+
+                line.clear();
+            }
+
+            last_pos = reader.stream_position().unwrap_or(last_pos);
+        }
+
+        info!("[RotationProxy][Retry] Request failure monitor stopped");
+    });
 }
 
 fn normalize_system_proxy(host: &str, port: u16) -> String {
@@ -275,6 +560,11 @@ async fn build_proxy_config_yaml_async(
     provider: Option<&RotationProxyProvider>,
 ) -> Result<String, String> {
     let proxy_url_line = build_proxy_url_line_with_rotation(config, provider).await;
+    let effective_request_retry = if provider.is_some() {
+        config.request_retry.max(MIN_ROTATION_REQUEST_RETRY)
+    } else {
+        config.request_retry
+    };
     let amp_api_key_line = build_amp_api_key_line(config);
     let amp_model_mappings_section = build_amp_model_mappings_section(config);
     let openai_compat_section = build_openai_compat_section(config);
@@ -334,7 +624,7 @@ ws-auth: {}
         config.usage_stats_enabled,
         config.logging_to_file,
         config.logs_max_total_size_mb,
-        config.request_retry,
+        effective_request_retry,
         config.max_retry_interval,
         proxy_url_line,
         config.quota_switch_project,
@@ -1007,6 +1297,15 @@ pub async fn start_proxy(
         state.ttl_monitor_running.store(false, Ordering::SeqCst);
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         state.ttl_monitor_running.store(true, Ordering::SeqCst);
+
+        // Start request-failure monitor to auto-rotate on dead/timeout/error proxy
+        start_rotation_error_monitor(
+            app.clone(),
+            provider.clone(),
+            ttl_monitor_running.clone(),
+            port,
+            config_dir.join("logs").join("main.log"),
+        );
         
         tokio::spawn(async move {
             println!("[RotationProxy] Starting TTL monitor task (sleep interval: 30s)");
