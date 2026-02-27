@@ -35,6 +35,8 @@ import { toastStore } from "../../stores/toast";
 interface ProviderSelectorProps {
   /** Current rotation URL value (for two-way sync) */
   rotationUrl: string;
+  /** Initial settings from config (used when URL doesn't have full info) */
+  initialSettings?: RotationProxySettings | null;
   /** Callback when URL should be updated (from form changes) */
   onUrlChange: (url: string) => void;
   /** Callback when settings are parsed from URL (for config update) */
@@ -175,11 +177,48 @@ export function ProviderSelector(props: ProviderSelectorProps) {
     }
   };
 
+  // Helper to get effective settings (URL first, then initialSettings from config)
+  const getEffectiveSettings = (): RotationProxySettings | undefined => {
+    const urlSettings = parseRotationUrl(props.rotationUrl);
+    if (urlSettings) {
+      return urlSettings;
+    }
+    // Fallback to initialSettings from config if URL doesn't have full info
+    if (props.initialSettings) {
+      return props.initialSettings;
+    }
+    return undefined;
+  };
+
   // Initial load - only once on mount
   onMount(() => {
     if (!hasLoadedProviders()) {
       setHasLoadedProviders(true);
       void loadProviders();
+    }
+
+    // Initialize form from URL or config settings
+    const settings = getEffectiveSettings();
+    if (settings) {
+      setIsSyncingFromUrl(true);
+
+      // Update provider selection
+      if (settings.providerId) {
+        setSelectedProviderId(settings.providerId);
+        void loadMetadata(settings.providerId);
+      }
+
+      // Update form fields
+      setApiKey(settings.apiKey || "");
+      setNetworkType(settings.networkType || "random");
+      setLocationFilter(settings.locationFilter || "0");
+
+      // Notify parent of the initial settings
+      setLastNotifiedSettings(settings);
+      props.onSettingsChange?.(settings);
+
+      // Reset syncing flag after a tick
+      setTimeout(() => setIsSyncingFromUrl(false), 0);
     }
   });
 
@@ -203,10 +242,17 @@ export function ProviderSelector(props: ProviderSelectorProps) {
             void loadMetadata(parsed.providerId);
           }
 
-          // Update form fields
-          setApiKey(parsed.apiKey);
-          setNetworkType(parsed.networkType || "random");
-          setLocationFilter(parsed.locationFilter || "0");
+          // Update form fields - merge with initialSettings if needed
+          const settings = getEffectiveSettings();
+          if (settings) {
+            setApiKey(parsed.apiKey || settings.apiKey || "");
+            setNetworkType(parsed.networkType || settings.networkType || "random");
+            setLocationFilter(parsed.locationFilter || settings.locationFilter || "0");
+          } else {
+            setApiKey(parsed.apiKey);
+            setNetworkType(parsed.networkType || "random");
+            setLocationFilter(parsed.locationFilter || "0");
+          }
 
           // Only notify parent if settings actually changed
           const lastNotified = untrack(lastNotifiedSettings);
@@ -218,11 +264,41 @@ export function ProviderSelector(props: ProviderSelectorProps) {
           // Reset syncing flag after a tick
           setTimeout(() => setIsSyncingFromUrl(false), 0);
         } else {
-          // URL is not a valid rotation URL
-          const lastNotified = untrack(lastNotifiedSettings);
-          if (lastNotified !== undefined) {
-            setLastNotifiedSettings(undefined);
-            props.onSettingsChange?.(undefined);
+          // URL is not a valid rotation URL - check if we have initialSettings
+          const settings = props.initialSettings;
+          if (settings) {
+            setIsSyncingFromUrl(true);
+
+            // Update provider selection
+            if (
+              settings.providerId &&
+              settings.providerId !== untrack(selectedProviderId)
+            ) {
+              setSelectedProviderId(settings.providerId);
+              void loadMetadata(settings.providerId);
+            }
+
+            // Update form fields from initialSettings
+            setApiKey(settings.apiKey || "");
+            setNetworkType(settings.networkType || "random");
+            setLocationFilter(settings.locationFilter || "0");
+
+            // Only notify parent if settings actually changed
+            const lastNotified = untrack(lastNotifiedSettings);
+            if (!rotationSettingsEqual(settings, lastNotified)) {
+              setLastNotifiedSettings(settings);
+              props.onSettingsChange?.(settings);
+            }
+
+            // Reset syncing flag after a tick
+            setTimeout(() => setIsSyncingFromUrl(false), 0);
+          } else {
+            // No valid settings at all
+            const lastNotified = untrack(lastNotifiedSettings);
+            if (lastNotified !== undefined) {
+              setLastNotifiedSettings(undefined);
+              props.onSettingsChange?.(undefined);
+            }
           }
         }
       },
