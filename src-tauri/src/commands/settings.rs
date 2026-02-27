@@ -4,6 +4,7 @@ use crate::config::save_config_to_file;
 use crate::state::AppState;
 use crate::types::{ReasoningEffortSettings, ThinkingBudgetSettings};
 use crate::{build_management_client, get_management_key, get_management_url};
+use log::info;
 use tauri::State;
 
 // ============================================
