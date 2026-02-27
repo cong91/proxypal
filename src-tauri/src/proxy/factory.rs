@@ -33,7 +33,9 @@ impl ProxyProviderFactory {
     pub fn create(url: &str) -> Result<DynProxyProvider, String> {
         // Try auto-detect based on URL patterns
         if url.contains("proxyxoay.shop") || url.contains("proxy.vn") {
-            return (PROVIDER_REGISTRY.get("proxy_vn").unwrap().factory)(url);
+            if let Some(entry) = PROVIDER_REGISTRY.get("proxy_vn") {
+                return (entry.factory)(url);
+            }
         }
 
         // Fallback: try all registered providers

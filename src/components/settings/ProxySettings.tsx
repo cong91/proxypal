@@ -320,12 +320,10 @@ export function ProxySettings(props: ProxySettingsProps) {
             rotationUrl={effectiveProxyUrl()}
             initialSettings={local.config().rotationSettings}
             onUrlChange={(url) => {
-              // Update local input immediately and debounce save
+              // Update local input immediately and update config without debounce
+              // since ProviderSelector handles its own debounce or direct changes
               setProxyUrlInput(url);
-              if (proxyUrlTimer) clearTimeout(proxyUrlTimer);
-              proxyUrlTimer = window.setTimeout(() => {
-                local.handleConfigChange("proxyUrl", url);
-              }, 500);
+              local.handleConfigChange("proxyUrl", url);
             }}
             onSettingsChange={(settings: RotationProxySettings | undefined) => {
               const currentConfig = local.config();

@@ -51,8 +51,9 @@ impl ProxyRotationInitializer {
             // Update state to Initializing
             {
                 let state = app_handle.state::<AppState>();
-                let mut init_state = state.rotation_init_state.lock().unwrap();
-                *init_state = RotationInitState::Initializing;
+                if let Ok(mut init_state) = state.rotation_init_state.lock() {
+                    *init_state = RotationInitState::Initializing;
+                };
             }
             
             // Perform initialization with singleflight
@@ -68,10 +69,11 @@ impl ProxyRotationInitializer {
                     
                     // Update state to Failed
                     let state = app_handle.state::<AppState>();
-                    let mut init_state = state.rotation_init_state.lock().unwrap();
-                    *init_state = RotationInitState::Failed {
-                        error: e.clone(),
-                        retry_after: Some(Instant::now() + Duration::from_secs(60)),
+                    if let Ok(mut init_state) = state.rotation_init_state.lock() {
+                        *init_state = RotationInitState::Failed {
+                            error: e.clone(),
+                            retry_after: Some(Instant::now() + Duration::from_secs(60)),
+                        };
                     };
                     
                     // Emit failure event
@@ -204,8 +206,9 @@ impl ProxyRotationInitializer {
         // Store provider in state
         {
             let state = app_handle.state::<AppState>();
-            let mut rotation_provider = state.rotation_provider.lock().unwrap();
-            *rotation_provider = Some(provider.clone());
+            if let Ok(mut rotation_provider) = state.rotation_provider.lock() {
+                *rotation_provider = Some(provider.clone());
+            };
         }
         
         // Fetch initial proxy with retry
@@ -226,10 +229,11 @@ impl ProxyRotationInitializer {
         // Update state to Initialized
         {
             let state = app_handle.state::<AppState>();
-            let mut init_state = state.rotation_init_state.lock().unwrap();
-            *init_state = RotationInitState::Initialized {
-                proxy_url: proxy_url.clone(),
-                expires_at,
+            if let Ok(mut init_state) = state.rotation_init_state.lock() {
+                *init_state = RotationInitState::Initialized {
+                    proxy_url: proxy_url.clone(),
+                    expires_at,
+                };
             };
         }
         

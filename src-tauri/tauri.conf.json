@@ -28,7 +28,7 @@
     }
   },
   "bundle": {
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "externalBin": ["binaries/cli-proxy-api"],
     "active": true,
     "targets": ["app", "dmg", "nsis", "appimage", "deb"],
